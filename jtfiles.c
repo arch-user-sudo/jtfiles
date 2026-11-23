@@ -1339,7 +1339,9 @@ typedef struct {
     int fd;
     char buf[4096];
     size_t len;
-    int active, cut, op;
+    int active, cut, op, internal;
+    int show_pending;                       /* progress window is delayed */
+    double show_at;                         /* monotonic time to show it */
     long long total_items, items_done;
     long long total_bytes, bytes_done;
     int done_items, failed;
@@ -1380,6 +1382,49 @@ typedef struct {
     App *app;
 } Output;
 
+/* One context per wl_data_offer.  MIME events arrive before the enter()
+ * or selection() event that says whether an offer is for DnD or clipboard,
+ * so the flags have to live on the offer itself, not in a single slot. */
+typedef struct DataOffer {
+    App *app;
+    struct wl_data_offer *offer;
+    struct DataOffer *next;
+    unsigned uris : 1;
+    unsigned gnome : 1;
+    unsigned text : 1;
+    char text_mime[64];
+} DataOffer;
+
+/* Frozen selection payload.  wl_data_source.send is a callback from the
+ * compositor and must never read live app state that can change later. */
+typedef struct {
+    char paths[64][PATH_MAX];
+    int n;
+    int cut;
+    char text[16384];
+    int has_text;
+} ClipSnapshot;
+
+/* Nonblocking wl_data_offer.receive() in progress. */
+typedef struct {
+    int fd;
+    size_t len;
+    int gnome;
+    int overflow;
+    int attempt;
+    double deadline;
+    /* 64 paths at PATH_MAX plus the gnome verb and separators. */
+    char buf[64 * PATH_MAX + 4096];
+} ClipRead;
+
+/* Nonblocking wl_data_source.send() writes, like GTK's GOutputStream writer. */
+typedef struct ClipWrite {
+    struct ClipWrite *next;
+    int fd;
+    char *buf;
+    size_t len, off;
+} ClipWrite;
+
 struct App {
     struct wl_display *display;
     struct wl_registry *registry;
@@ -1408,13 +1453,30 @@ struct App {
     struct wl_surface *dnd_icon_surface; /* drag icon surface */
     ShmBuf dnd_icon_buf;                 /* its backing buffer */
     struct wl_data_offer *dnd_offer;    /* incoming drag */
-    struct wl_data_offer *dnd_new_offer;/* offer pending enter (mimes arrive first) */
-    int dnd_new_accept;
+    DataOffer *dnd_ctx;                 /* context for dnd_offer */
+    DataOffer *offers;                  /* all live offer contexts */
     uint32_t dnd_enter_serial;
     int dnd_accept, dnd_accepted;
     int dnd_pending;                    /* left press on a file, awaiting threshold */
     int dnd_press_x, dnd_press_y;
     uint32_t dnd_press_serial;
+    uint32_t dnd_action;                /* negotiated drag action (source side) */
+    uint32_t dnd_offer_action;          /* action reported by wl_data_offer.action */
+    int dnd_have_gnome;                 /* incoming drag offers cut/copy verb */
+    struct wl_surface *dnd_target_surface; /* surface the drag entered */
+    double dnd_drop_x, dnd_drop_y;      /* last enter/motion coordinates */
+    char dnd_paths[64][PATH_MAX];       /* snapshot of our outgoing drag payload */
+    int n_dnd_paths;
+
+    /* Wayland clipboard (wl_data_device selection) */
+    struct wl_data_source *clip_source;  /* we own the selection */
+    struct wl_data_offer *clip_offer;    /* another client owns it */
+    DataOffer *clip_ctx;                 /* context for clip_offer */
+    ClipSnapshot clip_snap;              /* payload we published */
+    ClipRead clip_read;                  /* async remote paste */
+    ClipWrite *clip_writes;              /* pending source.send writes */
+    int clip_cache_valid;                /* clipboard[] belongs to clip_ctx */
+    uint32_t clip_serial;                /* last input serial for set_selection */
 
     struct wl_surface *surface;
     struct xdg_surface *xdg_surface;
@@ -1438,6 +1500,12 @@ struct App {
     char cli_start[PATH_MAX];
     char pending_select[NAME_MAX + 1];
     int pending_select_stage;      /* 0: none, 1: applied, 2: re-applied */
+    /* Basenames created by the last paste/drop.  Kept until the user selects
+     * something or navigates away so automatic rescans cannot wipe the
+     * highlight on freshly created entries. */
+    char post_dir[PATH_MAX];
+    char post_names[64][NAME_MAX + 1];
+    int n_post_names, post_armed;
     char *hist[64];
     int hist_n, hist_cap, hist_pos;
     Entry *ents;
@@ -1540,6 +1608,16 @@ static atomic_uint g_thumb_gen;
 static int worker_submit_count(const char *path, time_t mtime);
 static void watch_update(App *a, const char *path);
 static void dir_load(App *a, const char *path);
+static void scroll_index_into_view(App *a, int idx);
+static void post_xfer_disarm(App *a);
+static void apply_post_xfer_selection(App *a);
+static void clipboard_publish(App *a);
+static void clipboard_publish_text(App *a, const char *text);
+static int  clipboard_fetch(App *a, int *cut);
+static int  clipboard_has(App *a);
+static void clip_read_cancel(App *a);
+static void clip_write_cancel_all(App *a);
+static void clip_write_poll(App *a, int fd);
 
 /* ---- sidebar hover easing (driven by wl_surface.frame / vsync) ------- */
 
@@ -1668,6 +1746,56 @@ static const char *base_name(const char *p)
 {
     const char *s = strrchr(p, '/');
     return s ? s + 1 : p;
+}
+
+/* Track the exact destination names chosen for a paste/drop.  do_paste() is
+ * the single funnel for both clipboard paste and external DnD, and it is the
+ * only place where collision-resolved names like "file (copy)" exist. */
+static void post_xfer_disarm(App *a)
+{
+    a->post_armed = 0;
+    a->n_post_names = 0;
+    a->post_dir[0] = 0;
+}
+
+static void post_xfer_arm(App *a, const char *dir,
+                          char (*dsts)[PATH_MAX], int n)
+{
+    post_xfer_disarm(a);
+    if (!dir || !*dir || n <= 0) return;
+    snprintf(a->post_dir, sizeof a->post_dir, "%s", dir);
+    for (int i = 0; i < n && a->n_post_names < 64; i++) {
+        const char *name = base_name(dsts[i]);
+        if (!name || !*name) continue;
+        snprintf(a->post_names[a->n_post_names], NAME_MAX + 1, "%s", name);
+        a->n_post_names++;
+    }
+    if (a->n_post_names) a->post_armed = 1;
+}
+
+/* Called at the end of every dir_load(), including the inotify-driven ones
+ * that happen right after a transfer.  Matching is by visible name so only
+ * entries that really exist get highlighted, and partial failures are safe. */
+static void apply_post_xfer_selection(App *a)
+{
+    if (!a->post_armed || !a->post_dir[0]) return;
+    if (strcmp(a->cwd, a->post_dir)) return;
+    int first = -1, any = 0;
+    for (int k = 0; k < a->n_post_names; k++) {
+        for (int i = 0; i < a->n_ents; i++) {
+            if (strcmp(a->ents[i].name, a->post_names[k])) continue;
+            if (!a->selected[i]) { a->selected[i] = 1; a->n_selected++; }
+            if (first < 0) first = i;
+            any = 1;
+        }
+    }
+    if (any) {
+        if (first >= 0) {
+            a->sel = a->anchor = first;
+            scroll_index_into_view(a, first);
+        }
+        a->dirty = 1;
+    }
 }
 
 /* Turn a file path into "open its parent, highlight this name".  Keep the
@@ -2110,6 +2238,7 @@ static void dir_load(App *a, const char *path)
     a->scroll = 0;
     scroll_snap(a);
     a->drag_select = 0;
+    apply_post_xfer_selection(a);
     a->dirty = 1;
 }
 
@@ -2130,6 +2259,7 @@ static void hist_push(App *a, const char *path)
 
 static void navigate(App *a, const char *path, int push)
 {
+    post_xfer_disarm(a);
     struct stat st;
     if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
         status_set(a, "Not a folder: %s", path);
@@ -2143,6 +2273,7 @@ static void navigate(App *a, const char *path, int push)
 
 static void go_hist(App *a, int dir)
 {
+    post_xfer_disarm(a);
     int p = a->hist_pos + dir;
     if (p < 0 || p >= a->hist_n) return;
     a->hist_pos = p;
@@ -2434,6 +2565,7 @@ static int mod_active(App *a, const char *name)
 
 static void select_none(App *a)
 {
+    post_xfer_disarm(a);
     if (a->selected && a->n_ents > 0)
         memset(a->selected, 0, (size_t)a->n_ents);
     a->n_selected = 0;
@@ -2451,6 +2583,7 @@ static void select_one(App *a, int idx)
 
 static void select_toggle(App *a, int idx)
 {
+    post_xfer_disarm(a);
     if (!a->selected || idx < 0 || idx >= a->n_ents) return;
     if (a->selected[idx]) {
         a->selected[idx] = 0;
@@ -2478,6 +2611,8 @@ static void select_range(App *a, int idx)
 }
 
 static void xfer_window_open(App *a);
+static void xfer_window_schedule(App *a);
+static void xfer_window_maybe_open(App *a);
 static void xfer_window_close(App *a);
 static void xfer_draw(App *a);
 static void xfer_poll(App *a);
@@ -2901,13 +3036,15 @@ static void path_dirname(const char *path, char *out, size_t n)
     }
 }
 
-static void do_paste(App *a)
+static void do_paste(App *a, const char *dest_dir)
 {
     if (a->n_clip <= 0) { status_set(a, "Clipboard is empty"); return; }
     if (a->xfer.active) {
         status_set(a, "Another transfer is already running");
         return;
     }
+    /* An internal drop can target a different folder without changing cwd. */
+    const char *dir = dest_dir && *dest_dir ? dest_dir : a->cwd;
 
     int n = a->n_clip;
     if (n > 64) n = 64;
@@ -2921,7 +3058,7 @@ static void do_paste(App *a)
     int bad = 0;
     for (int i = 0; i < n; i++) {
         snprintf(srcs[i], PATH_MAX, "%s", a->clipboard[i]);
-        if (path_unique(a->cwd, srcs[i], dsts[i], PATH_MAX,
+        if (path_unique(dir, srcs[i], dsts[i], PATH_MAX,
                         !a->clip_cut) != 0)
             bad++;
     }
@@ -2950,6 +3087,7 @@ static void do_paste(App *a)
     char src_dir[PATH_MAX], dst_dir[PATH_MAX];
     path_dirname(srcs[0], src_dir, sizeof src_dir);
     path_dirname(dsts[0], dst_dir, sizeof dst_dir);
+    post_xfer_arm(a, dst_dir, dsts, n);
     pid_t pid = fork();
     if (pid == 0) {
         close(p[0]);
@@ -2967,6 +3105,7 @@ static void do_paste(App *a)
     close(p[1]);
     close(q[0]);
     if (pid < 0) {
+        post_xfer_disarm(a);
         close(q[1]);
         close(p[0]);
         free(srcs);
@@ -2988,6 +3127,7 @@ static void do_paste(App *a)
     free(srcs);
     free(dsts);
     if (!sent) {
+        post_xfer_disarm(a);
         close(p[0]);
         kill(pid, SIGKILL);
         waitpid(pid, NULL, 0);
@@ -3008,7 +3148,7 @@ static void do_paste(App *a)
     x->w = 520;
     x->h = 220;
     snprintf(x->current, sizeof x->current, "Scanning...");
-    xfer_window_open(a);
+    xfer_window_schedule(a);
     status_set(a, "%s %d item%s", cut ? "Moving" : "Copying", n,
                n == 1 ? "" : "s");
     a->dirty = 1;
@@ -3085,7 +3225,7 @@ static void fs_op_start(App *a, int op, char (*paths)[PATH_MAX], int n)
     x->w = 520;
     x->h = 220;
     snprintf(x->current, sizeof x->current, "Scanning...");
-    xfer_window_open(a);
+    xfer_window_schedule(a);
     status_set(a, "%s %d item%s", op == XOP_TRASH ?
                "Moving to Trash" : "Permanently deleting", n,
                n == 1 ? "" : "s");
@@ -3844,35 +3984,15 @@ static void action_activate(App *a, int id)
             snprintf(a->clipboard[a->n_clip++], PATH_MAX, "%s",
                      a->ents[idx[i]].path);
         a->clip_cut = id == A_CUT;
+        clipboard_publish(a);
         status_set(a, "%s %d item%s", id == A_CUT ? "Cut" : "Copied",
                    a->n_clip, a->n_clip == 1 ? "" : "s");
         break;
     }
     case A_COPY_PATH:
         if (e) {
-            int fd = open("/dev/null", O_WRONLY);
-            if (fd >= 0) close(fd);
-            const char *av[] = { "xclip", "-selection", "clipboard", NULL };
-            /* xclip is optional; fall back to xsel, then just show the path. */
-            if (access("/usr/bin/xclip", X_OK) == 0) {
-                pid_t pid = fork();
-                if (pid == 0) {
-                    int p[2];
-                    if (pipe(p) != 0) _exit(0);
-                    if (fork() == 0) {
-                        dup2(p[0], STDIN_FILENO);
-                        close(p[0]); close(p[1]);
-                        execvp(av[0], (char *const *)av);
-                        _exit(127);
-                    }
-                    ssize_t ignored = write(p[1], e->path, strlen(e->path));
-                    (void)ignored;
-                    close(p[1]);
-                    _exit(0);
-                }
-                if (pid > 0) waitpid(pid, NULL, 0);
-                status_set(a, "Copied path: %s", e->path);
-            } else status_set(a, "%s", e->path);
+            clipboard_publish_text(a, e->path);
+            status_set(a, "Copied path: %s", e->path);
         }
         break;
     case A_SHORTCUT:
@@ -3947,13 +4067,18 @@ static void action_activate(App *a, int id)
         break;
     }
     case A_REFRESH: drive_refresh(a); dir_load(a, a->cwd); break;
-    case A_PASTE: do_paste(a); break;
+    case A_PASTE: {
+        int cut = 0;
+        if (clipboard_fetch(a, &cut)) do_paste(a, NULL);
+        break;
+    }
     case A_UNDO:
         if (a->last_cut[0]) { snprintf(a->clipboard[0], PATH_MAX, "%s", a->last_cut);
                               a->n_clip = 1; a->clip_cut = 1; }
         status_set(a, "Nothing to undo");
         break;
     case A_SELECT_ALL:
+        post_xfer_disarm(a);
         for (int i = 0; i < a->n_ents; i++) a->selected[i] = 1;
         a->n_selected = a->n_ents;
         a->dirty = 1;
@@ -4046,7 +4171,7 @@ static void menu_open_root(App *a, uint32_t serial, int x, int y)
         mitem(m, 2, SUB_NEW, "New", "", 1);
         msep(m);
         mitem(m, 0, A_REFRESH, "Refresh", "F5", 1);
-        mitem(m, 0, A_PASTE, "Paste", "Ctrl+V", a->n_clip > 0);
+        mitem(m, 0, A_PASTE, "Paste", "Ctrl+V", clipboard_has(a));
         msep(m);
         mitem(m, 0, A_PROPERTIES, "Properties", "", 1);
     }
@@ -5074,6 +5199,7 @@ static void icon_label_lines(cairo_t *cr, const char *name, double size,
 static void select_in_rect(App *a, double x0, double y0, double x1, double y1,
                            int additive)
 {
+    post_xfer_disarm(a);
     if (!a->selected) return;
     double lx = x0 < x1 ? x0 : x1, rx = x0 > x1 ? x0 : x1;
     double ty = y0 < y1 ? y0 : y1, by = y0 > y1 ? y0 : y1;
@@ -6180,6 +6306,7 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
     (void)pointer; (void)time;
     App *a = data;
     a->pointer_serial = serial;
+    a->clip_serial = serial;
 
     if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
         a->dnd_pending = 0;
@@ -6499,8 +6626,9 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
                          uint32_t serial, uint32_t time, uint32_t key,
                          uint32_t state)
 {
-    (void)keyboard; (void)serial; (void)time;
+    (void)keyboard; (void)time;
     App *a = data;
+    a->clip_serial = serial;
     if (state != WL_KEYBOARD_KEY_STATE_PRESSED || !a->xkb_state) return;
     /* A transfer runs in a child process; keep navigation and shortcuts live
      * while it copies. Starting a second transfer is still blocked separately
@@ -6999,9 +7127,30 @@ static void xfer_window_open(App *a)
     wl_surface_commit(x->surface);
 }
 
+/* Fast copies finish before a progress window could be read.  Delay mapping
+ * it briefly and skip it entirely if the worker is already done. */
+#define XFER_WINDOW_DELAY 0.25
+
+static void xfer_window_schedule(App *a)
+{
+    Transfer *x = &a->xfer;
+    x->show_pending = 1;
+    x->show_at = mono_sec() + XFER_WINDOW_DELAY;
+}
+
+static void xfer_window_maybe_open(App *a)
+{
+    Transfer *x = &a->xfer;
+    if (!x->active || !x->show_pending) return;
+    if (mono_sec() < x->show_at) return;
+    x->show_pending = 0;
+    xfer_window_open(a);
+}
+
 static void xfer_window_close(App *a)
 {
     Transfer *x = &a->xfer;
+    x->show_pending = 0;
     if (x->frame_cb) { wl_callback_destroy(x->frame_cb); x->frame_cb = NULL; }
     for (int i = 0; i < 2; i++) shm_buffer_destroy(&x->bufs[i]);
     if (x->decoration) {
@@ -7241,8 +7390,10 @@ static void xfer_finish(App *a, int code)
     int done = x->done_items > 0 ? x->done_items : (int)x->items_done;
     int failed = x->failed;
     if (code != 0 && failed == 0) failed = 1;
+    if (code != 0) post_xfer_disarm(a);   /* cancelled: don't highlight partial output */
     int cut = x->cut;
     int op = x->op;
+    int internal = x->internal;
     int removes = op == XOP_TRASH || op == XOP_DELETE;
     /* Reload only if this transfer changed the folder we are looking at.
      * Navigate elsewhere during a copy and the old code still did a full
@@ -7275,7 +7426,22 @@ static void xfer_finish(App *a, int code)
                    done == 1 ? "" : "s");
     else
         status_set(a, "%s %d item%s", verb, done, done == 1 ? "" : "s");
-    if (cut && !removes) { a->n_clip = 0; a->clip_cut = 0; }
+    if (cut && !removes && !internal) {
+        a->n_clip = 0;
+        a->clip_cut = 0;
+        a->clip_cache_valid = 0;
+        /* The selection is now stale; give it up so other apps stop
+         * offering a cut whose source files no longer exist. */
+        clip_write_cancel_all(a);
+        if (a->clip_source) {
+            wl_data_source_destroy(a->clip_source);
+            a->clip_source = NULL;
+            if (a->data_device)
+                wl_data_device_set_selection(a->data_device, NULL,
+                                             a->clip_serial);
+            wl_display_flush(a->display);
+        }
+    }
     if (refresh) dir_load(a, a->cwd);
     a->dirty = 1;
 }
@@ -7509,6 +7675,451 @@ static void dnd_write_all(int fd, const char *s, size_t len)
     }
 }
 
+/* ------------------------------------------------------------------ */
+/*  Clipboard (wl_data_device selection)                               */
+/* ------------------------------------------------------------------ */
+
+static int clip_is_text_mime(const char *mime)
+{
+    return !strcmp(mime, "text/plain;charset=utf-8") ||
+           !strcmp(mime, "text/plain") ||
+           !strcmp(mime, "UTF8_STRING") ||
+           !strcmp(mime, "STRING") ||
+           !strcmp(mime, "TEXT");
+}
+
+static void clip_snapshot_files(App *a, char (*paths)[PATH_MAX], int n, int cut)
+{
+    memset(&a->clip_snap, 0, sizeof a->clip_snap);
+    if (n > 64) n = 64;
+    a->clip_snap.n = n > 0 ? n : 0;
+    a->clip_snap.cut = cut;
+    for (int i = 0; i < a->clip_snap.n; i++)
+        snprintf(a->clip_snap.paths[i], PATH_MAX, "%s", paths[i]);
+}
+
+static void clip_snapshot_text(App *a, const char *text)
+{
+    memset(&a->clip_snap, 0, sizeof a->clip_snap);
+    snprintf(a->clip_snap.text, sizeof a->clip_snap.text, "%s",
+             text ? text : "");
+    a->clip_snap.has_text = 1;
+    a->n_clip = 0;
+    a->clip_cut = 0;
+}
+
+/* Queue a nonblocking write for a wl_data_source.send() pipe.  GTK hands
+ * these fds to a GOutputStream instead of blocking the Wayland event loop. */
+static void clip_write_cancel_all(App *a)
+{
+    ClipWrite *w = a->clip_writes;
+    a->clip_writes = NULL;
+    while (w) {
+        ClipWrite *next = w->next;
+        close(w->fd);
+        free(w->buf);
+        free(w);
+        w = next;
+    }
+}
+
+static void clip_write_poll(App *a, int fd)
+{
+    ClipWrite **link = &a->clip_writes;
+    while (*link && (*link)->fd != fd) link = &(*link)->next;
+    ClipWrite *w = *link;
+    if (!w) return;
+
+    while (w->off < w->len) {
+        ssize_t n = write(w->fd, w->buf + w->off, w->len - w->off);
+        if (n > 0) { w->off += (size_t)n; continue; }
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        break;
+    }
+    *link = w->next;
+    close(w->fd);
+    free(w->buf);
+    free(w);
+}
+
+static void clip_write_enqueue(App *a, int fd, char *buf, size_t len)
+{
+    if (fd < 0 || !buf) {
+        if (fd >= 0) close(fd);
+        free(buf);
+        return;
+    }
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    ClipWrite *w = calloc(1, sizeof *w);
+    if (!w) { close(fd); free(buf); return; }
+    w->fd = fd;
+    w->buf = buf;
+    w->len = len;
+    w->next = a->clip_writes;
+    a->clip_writes = w;
+    clip_write_poll(a, fd);
+}
+
+/* Freeze the current payload for one mime type.  The gnome target carries the
+ * cut verb with LF endings; text/uri-list keeps its required CRLF endings. */
+static char *clip_build_payload(App *a, const char *mime, size_t *out_len)
+{
+    ClipSnapshot *s = &a->clip_snap;
+    int gnome = !strcmp(mime, "x-special/gnome-copied-files");
+    int uris = !strcmp(mime, "text/uri-list");
+    size_t cap = 64 * (PATH_MAX * 3 + 32) + 8192;
+    char *buf = malloc(cap);
+    if (!buf) return NULL;
+    size_t len = 0;
+
+#define CLIP_ADD(str_) do {                                     \
+        size_t n_ = strlen(str_);                               \
+        if (len + n_ + 1 > cap) { free(buf); return NULL; }     \
+        memcpy(buf + len, (str_), n_);                          \
+        len += n_;                                              \
+        buf[len] = 0;                                           \
+    } while (0)
+
+    if (s->has_text && !s->n) {
+        if (clip_is_text_mime(mime)) {
+            CLIP_ADD(s->text);
+        } else if (uris || gnome) {
+            char uri[PATH_MAX + 32];
+            path_to_uri(s->text, uri, sizeof uri);
+            if (gnome) CLIP_ADD("copy\n");
+            CLIP_ADD(uri);
+            if (!gnome) CLIP_ADD("\r\n");
+        }
+        *out_len = len;
+        return buf;
+    }
+
+    if (!s->n) { *out_len = 0; return buf; }
+
+    if (gnome) {
+        CLIP_ADD(s->cut ? "cut\n" : "copy\n");
+        /* Nemo splits this target on '\n' without dropping empty lines, so
+         * there must be no trailing newline after the final URI. */
+        for (int i = 0; i < s->n; i++) {
+            char uri[PATH_MAX + 32];
+            path_to_uri(s->paths[i], uri, sizeof uri);
+            if (i) CLIP_ADD("\n");
+            CLIP_ADD(uri);
+        }
+    } else {
+        for (int i = 0; i < s->n; i++) {
+            char line[PATH_MAX * 3 + 32];
+            if (clip_is_text_mime(mime)) {
+                snprintf(line, sizeof line, "%s\n", s->paths[i]);
+            } else {
+                char uri[PATH_MAX + 32];
+                path_to_uri(s->paths[i], uri, sizeof uri);
+                snprintf(line, sizeof line, "%s\r\n", uri);
+            }
+            CLIP_ADD(line);
+        }
+    }
+#undef CLIP_ADD
+
+    *out_len = len;
+    return buf;
+}
+
+static void clip_source_send(void *data, struct wl_data_source *source,
+                             const char *mime, int fd)
+{
+    (void)source;
+    App *a = data;
+    size_t len = 0;
+    char *buf = clip_build_payload(a, mime ? mime : "", &len);
+    clip_write_enqueue(a, fd, buf, len);
+}
+
+static void clip_source_target(void *data, struct wl_data_source *source,
+                               const char *mime)
+{ (void)data; (void)source; (void)mime; }
+
+static void clip_source_cancelled(void *data, struct wl_data_source *source)
+{
+    App *a = data;
+    if (a->clip_source != source) return;
+    clip_write_cancel_all(a);
+    wl_data_source_destroy(source);
+    a->clip_source = NULL;
+    a->n_clip = 0;
+    a->clip_cut = 0;
+    a->clip_cache_valid = 0;
+    memset(&a->clip_snap, 0, sizeof a->clip_snap);
+}
+
+static void clip_source_drop(void *data, struct wl_data_source *source)
+{ (void)data; (void)source; }
+static void clip_source_finished(void *data, struct wl_data_source *source)
+{ (void)data; (void)source; }
+static void clip_source_action(void *data, struct wl_data_source *source,
+                               uint32_t action)
+{ (void)data; (void)source; (void)action; }
+
+static const struct wl_data_source_listener clip_source_listener = {
+    .target = clip_source_target, .send = clip_source_send,
+    .cancelled = clip_source_cancelled,
+    .dnd_drop_performed = clip_source_drop,
+    .dnd_finished = clip_source_finished,
+    .action = clip_source_action,
+};
+
+static void clipboard_publish_snapshot(App *a)
+{
+    if (!a->data_device || !a->data_device_manager) return;
+    uint32_t serial = a->clip_serial ? a->clip_serial : a->pointer_serial;
+
+    clip_read_cancel(a);
+    a->clip_cache_valid = 0;
+    struct wl_data_source *old = a->clip_source;
+    a->clip_source = NULL;
+
+    /* GTK sets the new selection before destroying the old source.  If we
+     * destroy first, a clipboard manager can observe an empty selection and
+     * restore its own stale payload in the gap. */
+    if (!a->clip_snap.n && !a->clip_snap.has_text) {
+        clip_write_cancel_all(a);
+        wl_data_device_set_selection(a->data_device, NULL, serial);
+        if (old) wl_data_source_destroy(old);
+        wl_display_flush(a->display);
+        return;
+    }
+
+    struct wl_data_source *src =
+        wl_data_device_manager_create_data_source(a->data_device_manager);
+    if (!src) {
+        a->clip_source = old;
+        return;
+    }
+    clip_write_cancel_all(a);
+    wl_data_source_add_listener(src, &clip_source_listener, a);
+    static const char *const mimes[] = {
+        "x-special/gnome-copied-files",
+        "text/uri-list",
+        "text/plain;charset=utf-8",
+        "text/plain",
+        "UTF8_STRING",
+        "STRING",
+        "TEXT",
+    };
+    for (unsigned i = 0; i < sizeof mimes / sizeof mimes[0]; i++)
+        wl_data_source_offer(src, mimes[i]);
+    a->clip_source = src;
+    wl_data_device_set_selection(a->data_device, src, serial);
+    if (old) wl_data_source_destroy(old);
+    wl_display_flush(a->display);
+}
+
+/* Cut/Copy freezes the selected paths here.  Later selection changes cannot
+ * make a pending paste send the wrong payload. */
+static void clipboard_publish(App *a)
+{
+    clip_snapshot_files(a, a->clipboard, a->n_clip, a->clip_cut);
+    clipboard_publish_snapshot(a);
+}
+
+static void clipboard_publish_text(App *a, const char *text)
+{
+    clip_snapshot_text(a, text);
+    clipboard_publish_snapshot(a);
+}
+
+static int clipboard_has(App *a)
+{
+    return a->n_clip > 0 || a->clip_source || a->clip_snap.has_text ||
+           (a->clip_ctx && (a->clip_ctx->uris || a->clip_ctx->gnome ||
+                            a->clip_ctx->text));
+}
+
+static void clip_read_cancel(App *a)
+{
+    if (a->clip_read.fd >= 0) {
+        close(a->clip_read.fd);
+        a->clip_read.fd = -1;
+    }
+    a->clip_read.len = 0;
+    a->clip_read.overflow = 0;
+}
+
+static int clipboard_store_payload(App *a, const char *buf, int gnome,
+                                   int *cut)
+{
+    *cut = 0;
+    if (!buf || !*buf) return 0;
+
+    const char *lines = buf;
+    if (gnome) {
+        const char *nl = strchr(buf, '\n');
+        if (!nl) return 0;
+        size_t vlen = (size_t)(nl - buf);
+        if (vlen == 3 && !strncmp(buf, "cut", 3)) *cut = 1;
+        lines = nl + 1;
+    }
+
+    int count = 0;
+    char *save = NULL;
+    char *copy = strdup(lines);
+    if (!copy) return 0;
+    for (char *line = strtok_r(copy, "\r\n", &save);
+         line && count < 64; line = strtok_r(NULL, "\r\n", &save)) {
+        if (!*line || *line == '#') continue;
+        char path[PATH_MAX];
+        if (!strncmp(line, "file://", 7))
+            uri_to_path(line, path, sizeof path);
+        else
+            snprintf(path, sizeof path, "%s", line);
+        if (!*path || access(path, F_OK) != 0) continue;
+        snprintf(a->clipboard[count], PATH_MAX, "%s", path);
+        count++;
+    }
+    free(copy);
+    return count;
+}
+
+/* Nonblocking replacement for the old blocking clipboard_read_offer(). */
+static int clipboard_start_async(App *a)
+{
+    DataOffer *ctx = a->clip_ctx;
+    if (!ctx || !(ctx->uris || ctx->gnome || ctx->text)) return 0;
+
+    a->clip_cache_valid = 0;
+    const char *mime;
+    if (ctx->gnome) mime = "x-special/gnome-copied-files";
+    else if (ctx->uris) mime = "text/uri-list";
+    else if (ctx->text_mime[0]) mime = ctx->text_mime;
+    else mime = "text/plain;charset=utf-8";
+
+    int p[2];
+    if (pipe2(p, O_CLOEXEC) < 0) return 0;
+    wl_data_offer_receive(ctx->offer, mime, p[1]);
+    close(p[1]);
+    int flags = fcntl(p[0], F_GETFL, 0);
+    if (flags >= 0) fcntl(p[0], F_SETFL, flags | O_NONBLOCK);
+    wl_display_flush(a->display);
+
+    clip_read_cancel(a);
+    ClipRead *r = &a->clip_read;
+    r->fd = p[0];
+    r->len = 0;
+    r->overflow = 0;
+    r->attempt++;
+    r->gnome = ctx->gnome ? 1 : 0;
+    r->deadline = mono_sec() + 5.0;
+    return 1;
+}
+
+/* Called from the main poll loop whenever the transfer fd is readable or
+ * its deadline has passed.  The compositor keeps the UI loop alive while
+ * the source process writes, so we never block inside a key handler. */
+static void clip_read_drain(App *a)
+{
+    ClipRead *r = &a->clip_read;
+    if (r->fd < 0) return;
+
+    for (;;) {
+        if (r->len + 1 >= sizeof r->buf) {
+            r->overflow = 1;
+            break;
+        }
+        ssize_t n = read(r->fd, r->buf + r->len,
+                         sizeof r->buf - 1 - r->len);
+        if (n > 0) { r->len += (size_t)n; continue; }
+        if (n == 0) break;
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (mono_sec() >= r->deadline) {
+                status_set(a, "Clipboard source timed out");
+                clip_read_cancel(a);
+            }
+            return;
+        }
+        break;
+    }
+
+    r->buf[r->len] = 0;
+    int gnome = r->gnome;
+    int empty = (r->len == 0);
+    int overflow = r->overflow;
+    close(r->fd);
+    r->fd = -1;
+    r->len = 0;
+
+    if (overflow) {
+        status_set(a, "Clipboard payload is too large");
+        return;
+    }
+
+    /* Guard against a focus change replacing the offer just before receive().
+     * An inert offer closes the pipe immediately, so retry once against the
+     * live offer if the compositor published one. */
+    if (empty && r->attempt < 3) {
+        DataOffer *old = a->clip_ctx;
+        if (wl_display_roundtrip(a->display) == 0 &&
+            a->clip_ctx && a->clip_ctx != old &&
+            (a->clip_ctx->uris || a->clip_ctx->gnome || a->clip_ctx->text) &&
+            clipboard_start_async(a))
+            return;
+    }
+
+    int cut = 0;
+    int count = clipboard_store_payload(a, r->buf, gnome, &cut);
+    if (!count) {
+        status_set(a, "Clipboard has no file paths");
+        return;
+    }
+    a->n_clip = count;
+    a->clip_cut = cut;
+    a->clip_cache_valid = 1;   /* GTK-style per-offer buffer cache */
+    do_paste(a, NULL);
+}
+
+/* Pull a remote selection into a pending async read, or use local state.
+ * A zero return with an active offer means paste will finish later. */
+static int clipboard_fetch(App *a, int *cut)
+{
+    *cut = 0;
+    /* If we own the selection, our staged payload wins even before the
+     * compositor echoes the selection event back to us. */
+    if (a->clip_source) {
+        if (a->n_clip > 0) {
+            *cut = a->clip_cut;
+            return a->n_clip;
+        }
+        if (a->clip_snap.has_text && !a->clip_snap.n) {
+            int c = 0;
+            int n = clipboard_store_payload(a, a->clip_snap.text, 0, &c);
+            if (n) return n;
+        }
+    }
+    /* A completed read is cached until the selection changes, just as GTK
+     * caches each SelectionBuffer on the wl_data_offer. */
+    if (a->clip_ctx && a->clip_cache_valid && a->n_clip > 0) {
+        *cut = a->clip_cut;
+        return a->n_clip;
+    }
+    if (a->clip_ctx && (a->clip_ctx->uris || a->clip_ctx->gnome ||
+                        a->clip_ctx->text)) {
+        a->clip_read.attempt = 0;   /* new paste, not an empty-offer retry */
+        if (clipboard_start_async(a)) return 0;
+    }
+    if (a->n_clip > 0) {
+        *cut = a->clip_cut;
+        return a->n_clip;
+    }
+    if (a->clip_snap.has_text && !a->clip_snap.n) {
+        int c = 0;
+        int n = clipboard_store_payload(a, a->clip_snap.text, 0, &c);
+        if (n) return n;
+    }
+    return 0;
+}
+
 static void dnd_icon_destroy(App *a);
 
 static void dnd_source_send(void *data, struct wl_data_source *source,
@@ -7516,8 +8127,12 @@ static void dnd_source_send(void *data, struct wl_data_source *source,
 {
     (void)source;
     App *a = data;
+    int gnome = !strcmp(mime, "x-special/gnome-copied-files");
+    const char *eol = gnome ? "\n" : "\r\n";
     const char *prefix = "";
-    if (!strcmp(mime, "x-special/gnome-copied-files")) prefix = "copy\n";
+    if (gnome)
+        prefix = a->dnd_action == WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE
+                     ? "cut\n" : "copy\n";
     else if (strcmp(mime, "text/uri-list") && strcmp(mime, "text/plain") &&
              strcmp(mime, "text/plain;charset=utf-8") &&
              strcmp(mime, "UTF8_STRING") && strcmp(mime, "STRING")) {
@@ -7529,11 +8144,13 @@ static void dnd_source_send(void *data, struct wl_data_source *source,
     size_t len = 0;
     size_t plen = strlen(prefix);
     if (plen < sizeof buf) { memcpy(buf, prefix, plen); len = plen; }
-    for (int i = 0; i < a->n_ents && len + 300 < sizeof buf; i++) {
-        if (!a->selected[i]) continue;
+    int nsrc = a->n_dnd_paths ? a->n_dnd_paths : a->n_ents;
+    for (int i = 0; i < nsrc && len + 300 < sizeof buf; i++) {
+        if (!a->n_dnd_paths && !a->selected[i]) continue;
+        const char *path = a->n_dnd_paths ? a->dnd_paths[i] : a->ents[i].path;
         char uri[PATH_MAX + 32];
-        path_to_uri(a->ents[i].path, uri, sizeof uri);
-        int n = snprintf(buf + len, sizeof buf - len, "%s\r\n", uri);
+        path_to_uri(path, uri, sizeof uri);
+        int n = snprintf(buf + len, sizeof buf - len, "%s%s", uri, eol);
         if (n <= 0 || (size_t)n >= sizeof buf - len) break;
         len += (size_t)n;
     }
@@ -7572,7 +8189,11 @@ static void dnd_source_finished(void *data, struct wl_data_source *source)
 
 static void dnd_source_action(void *data, struct wl_data_source *source,
                               uint32_t action)
-{ (void)data; (void)source; (void)action; }
+{
+    (void)source;
+    App *a = data;
+    a->dnd_action = action;
+}
 
 static const struct wl_data_source_listener dnd_source_listener = {
     .target = dnd_source_target, .send = dnd_source_send,
@@ -7653,6 +8274,15 @@ static void dnd_begin(App *a)
     for (int i = 0; i < a->n_ents; i++) if (a->selected[i]) nsel++;
     if (!nsel) { a->dnd_pending = 0; return; }
 
+    /* Freeze the payload now: the user can change the selection while the
+     * compositor owns the pointer, and receiving our own offer later must not
+     * depend on the source running a nested Wayland dispatch. */
+    a->n_dnd_paths = 0;
+    for (int i = 0; i < a->n_ents && a->n_dnd_paths < 64; i++)
+        if (a->selected[i])
+            snprintf(a->dnd_paths[a->n_dnd_paths++], PATH_MAX, "%s",
+                     a->ents[i].path);
+
     struct wl_data_source *src =
         wl_data_device_manager_create_data_source(a->data_device_manager);
     if (!src) return;
@@ -7660,11 +8290,12 @@ static void dnd_begin(App *a)
     wl_data_source_offer(src, "text/uri-list");
     wl_data_source_offer(src, "x-special/gnome-copied-files");
     wl_data_source_offer(src, "text/plain;charset=utf-8");
-    if (wl_data_source_get_version(src) >= 2)
+    if (wl_data_source_get_version(src) >= WL_DATA_SOURCE_SET_ACTIONS_SINCE_VERSION)
         wl_data_source_set_actions(src, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
                                         WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
     a->dnd_source = src;
     a->dnd_pending = 0;
+    a->dnd_action = 0;
     a->drag_select = 0;
     struct wl_surface *icon = dnd_icon_create(a);
     wl_data_device_start_drag(a->data_device, src, a->surface, icon,
@@ -7672,11 +8303,13 @@ static void dnd_begin(App *a)
     wl_display_flush(a->display);
 }
 
-static void dnd_receive_uris(App *a, struct wl_data_offer *offer)
+static int dnd_receive_uris(App *a, struct wl_data_offer *offer)
 {
+    const char *mime = a->dnd_have_gnome ? "x-special/gnome-copied-files"
+                                         : "text/uri-list";
     int p[2];
-    if (pipe2(p, O_CLOEXEC) < 0) return;
-    wl_data_offer_receive(offer, "text/uri-list", p[1]);
+    if (pipe2(p, O_CLOEXEC) < 0) return 0;
+    wl_data_offer_receive(offer, mime, p[1]);
     close(p[1]);
     wl_display_flush(a->display);
 
@@ -7692,9 +8325,24 @@ static void dnd_receive_uris(App *a, struct wl_data_offer *offer)
     close(p[0]);
     buf[len] = 0;
 
+    /* The gnome target starts with "cut" or "copy"; following lines are the
+     * same URIs text/uri-list would carry.  A cut is performed as a move by
+     * do_paste(), so the source app never has to delete anything itself. */
+    int cut = 0;
+    char *lines = buf;
+    if (a->dnd_have_gnome) {
+        char *nl = strchr(buf, '\n');
+        if (nl) {
+            *nl = 0;
+            cut = !strcmp(buf, "cut") || !strncmp(buf, "cut\r", 4);
+            lines = nl + 1;
+        }
+    }
+    if (a->dnd_source) cut = 0;   /* our own drag: keep the old copy behavior */
+
     int count = 0;
     char *save = NULL;
-    for (char *line = strtok_r(buf, "\r\n", &save);
+    for (char *line = strtok_r(lines, "\r\n", &save);
          line && count < 64; line = strtok_r(NULL, "\r\n", &save)) {
         if (!*line || *line == '#') continue;
         char path[PATH_MAX];
@@ -7705,21 +8353,27 @@ static void dnd_receive_uris(App *a, struct wl_data_offer *offer)
     }
     if (count) {
         a->n_clip = count;
-        a->clip_cut = 0;
-        do_paste(a);
+        a->clip_cut = cut;
+        do_paste(a, NULL);
+        return 1;
     }
+    return 0;
 }
 
+/* MIME events arrive before enter()/selection(), so record them on the
+ * offer context rather than in a shared "new offer" slot. */
 static void dnd_offer_offer(void *data, struct wl_data_offer *offer,
                             const char *mime)
 {
-    App *a = data;
-    /* Mime events arrive on data_offer BEFORE the enter event that tells us
-     * which offer is active.  Remember acceptance on the pending offer. */
-    if (offer != a->dnd_new_offer) return;
-    if (!strcmp(mime, "text/uri-list") ||
-        !strcmp(mime, "x-special/gnome-copied-files"))
-        a->dnd_new_accept = 1;
+    (void)offer;
+    DataOffer *ctx = data;
+    if (!strcmp(mime, "text/uri-list")) ctx->uris = 1;
+    if (!strcmp(mime, "x-special/gnome-copied-files")) ctx->gnome = 1;
+    if (clip_is_text_mime(mime)) {
+        ctx->text = 1;
+        if (!ctx->text_mime[0])
+            snprintf(ctx->text_mime, sizeof ctx->text_mime, "%s", mime);
+    }
 }
 
 static void dnd_offer_source_actions(void *data, struct wl_data_offer *offer,
@@ -7728,65 +8382,259 @@ static void dnd_offer_source_actions(void *data, struct wl_data_offer *offer,
 
 static void dnd_offer_action(void *data, struct wl_data_offer *offer,
                              uint32_t action)
-{ (void)data; (void)offer; (void)action; }
+{
+    (void)offer;
+    DataOffer *ctx = data;
+    if (ctx->app->dnd_ctx == ctx)
+        ctx->app->dnd_offer_action = action;
+}
 
 static const struct wl_data_offer_listener dnd_offer_listener = {
     .offer = dnd_offer_offer, .source_actions = dnd_offer_source_actions,
     .action = dnd_offer_action,
 };
 
+static DataOffer *data_offer_create(App *a, struct wl_data_offer *offer)
+{
+    DataOffer *ctx = calloc(1, sizeof *ctx);
+    if (!ctx) { wl_data_offer_destroy(offer); return NULL; }
+    ctx->app = a;
+    ctx->offer = offer;
+    ctx->next = a->offers;
+    a->offers = ctx;
+    wl_data_offer_add_listener(offer, &dnd_offer_listener, ctx);
+    return ctx;
+}
+
+static DataOffer *data_offer_find(App *a, struct wl_data_offer *offer)
+{
+    for (DataOffer *c = a->offers; c; c = c->next)
+        if (c->offer == offer) return c;
+    return NULL;
+}
+
+static void data_offer_destroy(App *a, DataOffer *ctx)
+{
+    if (!ctx) return;
+    DataOffer **link = &a->offers;
+    while (*link && *link != ctx) link = &(*link)->next;
+    if (*link) *link = ctx->next;
+    if (a->clip_ctx == ctx) {
+        a->clip_ctx = NULL;
+        a->clip_offer = NULL;
+        a->clip_cache_valid = 0;
+        clip_read_cancel(a);
+    }
+    if (a->dnd_ctx == ctx) {
+        a->dnd_ctx = NULL;
+        a->dnd_offer = NULL;
+    }
+    wl_data_offer_destroy(ctx->offer);
+    free(ctx);
+}
+
+/* Offers that never became active (focus changes, cancelled drags) would
+ * otherwise live until exit.  Keep the active contexts and the new one. */
+static void data_offer_prune(App *a, DataOffer *keep)
+{
+    DataOffer *c = a->offers;
+    while (c) {
+        DataOffer *next = c->next;
+        if (c != keep && c != a->clip_ctx && c != a->dnd_ctx)
+            data_offer_destroy(a, c);
+        c = next;
+    }
+}
+
+static void data_offer_destroy_all(App *a)
+{
+    clip_read_cancel(a);
+    a->clip_cache_valid = 0;
+    while (a->offers) data_offer_destroy(a, a->offers);
+    a->clip_ctx = a->dnd_ctx = NULL;
+    a->clip_offer = a->dnd_offer = NULL;
+}
+
+/* Folder entry under the drop point, ignoring one of the dragged items. */
+static Entry *dnd_drop_entry(App *a, double x, double y)
+{
+    if (x < SIDEBAR_W || y < file_top_y(a) || y >= a->WIN_H - STATUS_H)
+        return NULL;
+    int idx = -1;
+    if (a->view == VIEW_ICONS || a->view == VIEW_TILES) {
+        if (!icon_grid_hit(a, x, y, &idx)) return NULL;
+    } else {
+        idx = (int)((y - file_top_y(a)) / ROW_H) + scroll_hit(a);
+    }
+    if (idx < 0 || idx >= a->n_ents) return NULL;
+    Entry *e = &a->ents[idx];
+    if (!e->is_dir) return NULL;
+    for (int i = 0; i < a->n_dnd_paths; i++)
+        if (!strcmp(e->path, a->dnd_paths[i])) return NULL;
+    return e;
+}
+
+/* Our own drag coming back to us: move the snapshotted files without going
+ * through wl_data_offer.receive().  A client cannot dispatch the compositor's
+ * wl_data_source.send event while it is blocked reading the transfer pipe. */
+static void dnd_internal_drop(App *a)
+{
+    if (!a->dnd_source || !a->n_dnd_paths) return;
+
+    char saved_clip[64][PATH_MAX];
+    int saved_n = a->n_clip, saved_cut = a->clip_cut;
+    for (int i = 0; i < saved_n; i++)
+        memcpy(saved_clip[i], a->clipboard[i], PATH_MAX);
+
+    for (int i = 0; i < a->n_dnd_paths; i++)
+        snprintf(a->clipboard[i], PATH_MAX, "%s", a->dnd_paths[i]);
+    a->n_clip = a->n_dnd_paths;
+    a->clip_cut = 1;              /* an internal drag is a move */
+
+    char folder[PATH_MAX];
+    const char *dir = NULL;
+    Entry *e = (a->dnd_target_surface == a->surface)
+                   ? dnd_drop_entry(a, a->dnd_drop_x, a->dnd_drop_y) : NULL;
+    if (e) {
+        snprintf(folder, sizeof folder, "%s", e->path);
+        dir = folder;
+    }
+    do_paste(a, dir);
+    /* The transfer is asynchronous; keep xfer_finish() from clearing the
+     * clipboard we just restored for the user. */
+    if (a->xfer.active) a->xfer.internal = 1;
+
+    for (int i = 0; i < saved_n; i++)
+        memcpy(a->clipboard[i], saved_clip[i], PATH_MAX);
+    a->n_clip = saved_n;
+    a->clip_cut = saved_cut;
+    a->dnd_target_surface = NULL;
+}
+
+/* v3 offers must be finished, otherwise wlroots turns a successful drop into
+ * wl_data_source.cancelled on the source side instead of dnd_finished. */
+static void dnd_offer_release(App *a, int success)
+{
+    DataOffer *ctx = a->dnd_ctx;
+    if (ctx) {
+        struct wl_data_offer *offer = ctx->offer;
+        if (success && a->dnd_accepted &&
+            wl_data_offer_get_version(offer) >= WL_DATA_OFFER_FINISH_SINCE_VERSION &&
+            a->dnd_offer_action != WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE &&
+            a->dnd_offer_action != WL_DATA_DEVICE_MANAGER_DND_ACTION_ASK)
+            wl_data_offer_finish(offer);
+        data_offer_destroy(a, ctx);
+    }
+    a->dnd_accept = a->dnd_accepted = 0;
+    a->dnd_offer_action = WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
+    a->dnd_target_surface = NULL;
+    data_offer_prune(a, NULL);
+}
+
 static void dnd_data_device_enter(void *data, struct wl_data_device *device,
                                   uint32_t serial, struct wl_surface *surface,
                                   wl_fixed_t x, wl_fixed_t y,
                                   struct wl_data_offer *offer)
 {
-    (void)device; (void)surface; (void)x; (void)y;
+    (void)device;
     App *a = data;
-    if (a->dnd_offer) wl_data_offer_destroy(a->dnd_offer);
-    a->dnd_offer = offer;
+    if (a->dnd_ctx) data_offer_destroy(a, a->dnd_ctx);
+    DataOffer *ctx = data_offer_find(a, offer);
+    if (!ctx) ctx = data_offer_create(a, offer);
+    a->dnd_ctx = ctx;
+    a->dnd_offer = ctx ? offer : NULL;
     a->dnd_enter_serial = serial;
+    a->dnd_offer_action = WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
+    a->dnd_target_surface = (surface == a->surface) ? surface : NULL;
+    a->dnd_drop_x = wl_fixed_to_double(x);
+    a->dnd_drop_y = wl_fixed_to_double(y);
+    if (!ctx) return;
     /* Mime events were delivered before enter(); use what we recorded. */
-    a->dnd_accept = (offer == a->dnd_new_offer) ? a->dnd_new_accept : 0;
+    a->dnd_accept = ctx->uris || ctx->gnome;
+    a->dnd_have_gnome = ctx->gnome;
     a->dnd_accepted = 0;
     if (a->dnd_accept) {
-        wl_data_offer_accept(offer, serial, "text/uri-list");
+        wl_data_offer_accept(offer, serial, a->dnd_have_gnome
+                             ? "x-special/gnome-copied-files" : "text/uri-list");
         a->dnd_accepted = 1;
-        if (wl_data_offer_get_version(offer) >= 2)
+        if (wl_data_offer_get_version(offer) >= WL_DATA_OFFER_SET_ACTIONS_SINCE_VERSION)
             wl_data_offer_set_actions(offer,
-                WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY,
+                WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+                WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE,
                 WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
     }
-    a->dnd_new_offer = NULL;
-    a->dnd_new_accept = 0;
+    data_offer_prune(a, ctx);
 }
 
 static void dnd_data_device_motion(void *data, struct wl_data_device *device,
                                    uint32_t time, wl_fixed_t x, wl_fixed_t y)
-{ (void)data; (void)device; (void)time; (void)x; (void)y; }
+{
+    (void)device; (void)time;
+    App *a = data;
+    a->dnd_drop_x = wl_fixed_to_double(x);
+    a->dnd_drop_y = wl_fixed_to_double(y);
+}
 
 static void dnd_data_device_leave(void *data, struct wl_data_device *device)
 {
     (void)device;
     App *a = data;
-    if (a->dnd_offer) { wl_data_offer_destroy(a->dnd_offer); a->dnd_offer = NULL; }
+    if (a->dnd_ctx) data_offer_destroy(a, a->dnd_ctx);
     a->dnd_accept = a->dnd_accepted = 0;
+    a->dnd_offer_action = WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
+    a->dnd_target_surface = NULL;
+    data_offer_prune(a, NULL);
 }
 
 static void dnd_data_device_drop(void *data, struct wl_data_device *device)
 {
     (void)device;
     App *a = data;
-    if (a->dnd_offer && a->dnd_accept) dnd_receive_uris(a, a->dnd_offer);
-    if (a->dnd_offer) { wl_data_offer_destroy(a->dnd_offer); a->dnd_offer = NULL; }
-    a->dnd_accept = a->dnd_accepted = 0;
+    int ok = 0;
+    if (a->dnd_source) {
+        dnd_internal_drop(a);
+        ok = 1;                 /* no pipe transfer: no deadlock, no data lost */
+    } else if (a->dnd_offer && a->dnd_accept) {
+        ok = dnd_receive_uris(a, a->dnd_offer);
+    }
+    dnd_offer_release(a, ok);
 }
 
 static void dnd_data_device_selection(void *data, struct wl_data_device *device,
                                       struct wl_data_offer *offer)
 {
-    (void)data; (void)device;
-    /* Clipboard is handled with xclip; ignore the data-device selection. */
-    if (offer) wl_data_offer_destroy(offer);
+    (void)device;
+    App *a = data;
+    clip_read_cancel(a);
+    a->clip_cache_valid = 0;
+    if (a->clip_ctx) data_offer_destroy(a, a->clip_ctx);
+
+    /* The compositor echoes our own selection back to us.  Keep the staged
+     * clipboard payload: clearing it here would make the next local paste
+     * fail after copy/cut. */
+    if (a->clip_source) {
+        if (offer) {
+            DataOffer *ctx = data_offer_find(a, offer);
+            if (ctx) data_offer_destroy(a, ctx);
+            else data_offer_create(a, offer);
+        }
+        data_offer_prune(a, NULL);
+        return;
+    }
+
+    a->n_clip = 0;
+    a->clip_cut = 0;
+    if (offer) {
+        DataOffer *ctx = data_offer_find(a, offer);
+        if (!ctx) ctx = data_offer_create(a, offer);
+        if (ctx && (ctx->uris || ctx->gnome || ctx->text)) {
+            a->clip_ctx = ctx;
+            a->clip_offer = offer;
+        } else if (ctx) {
+            data_offer_destroy(a, ctx);
+        }
+    }
+    data_offer_prune(a, NULL);
 }
 
 static void dnd_data_device_data_offer(void *data,
@@ -7795,11 +8643,8 @@ static void dnd_data_device_data_offer(void *data,
 {
     (void)device;
     App *a = data;
-    /* Mime events arrive immediately after this callback, before enter().
-     * Remember this offer so dnd_offer_offer() can record its types. */
-    a->dnd_new_offer = offer;
-    a->dnd_new_accept = 0;
-    wl_data_offer_add_listener(offer, &dnd_offer_listener, data);
+    /* Create a context now; MIME events that follow are recorded on it. */
+    data_offer_create(a, offer);
 }
 
 static const struct wl_data_device_listener dnd_data_device_listener = {
@@ -7811,6 +8656,12 @@ static const struct wl_data_device_listener dnd_data_device_listener = {
 
 static void release_seat(App *a)
 {
+    clip_write_cancel_all(a);
+    if (a->clip_source) {
+        wl_data_source_destroy(a->clip_source);
+        a->clip_source = NULL;
+    }
+    data_offer_destroy_all(a);
     if (a->data_device) {
         wl_data_device_destroy(a->data_device);
         a->data_device = NULL;
@@ -7819,11 +8670,10 @@ static void release_seat(App *a)
         wl_data_source_destroy(a->dnd_source);
         a->dnd_source = NULL;
     }
-    if (a->dnd_offer) {
-        wl_data_offer_destroy(a->dnd_offer);
-        a->dnd_offer = NULL;
-    }
     a->dnd_pending = 0;
+    a->n_dnd_paths = 0;
+    a->dnd_target_surface = NULL;
+    a->dnd_offer_action = WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
     if (a->cursor_device) {
         wp_cursor_shape_device_v1_destroy(a->cursor_device);
         a->cursor_device = NULL;
@@ -8335,9 +9185,10 @@ static int pump_events(App *a, int timeout_ms)
         want_write = 1;
     }
 
-    struct pollfd fds[5 + 8 + 1];
+    struct pollfd fds[32];
     int job_idx[8];
-    int n_job_fds = 0;
+    int write_idx[16];
+    int n_job_fds = 0, n_write_fds = 0;
     int nfds = 0;
 
     int wl_idx = nfds;
@@ -8347,7 +9198,7 @@ static int pump_events(App *a, int timeout_ms)
     nfds++;
 
     int ctl_idx = -1, client_idx = -1, xfer_idx = -1, thumb_idx = -1;
-    int ino_idx = -1;
+    int ino_idx = -1, clip_idx = -1;
     if (a->ctl_fd >= 0) {
         ctl_idx = nfds;
         fds[nfds].fd = a->ctl_fd;
@@ -8383,6 +9234,13 @@ static int pump_events(App *a, int timeout_ms)
         fds[nfds].revents = 0;
         nfds++;
     }
+    if (a->clip_read.fd >= 0) {
+        clip_idx = nfds;
+        fds[nfds].fd = a->clip_read.fd;
+        fds[nfds].events = POLLIN;
+        fds[nfds].revents = 0;
+        nfds++;
+    }
 
     for (unsigned i = 0; i < sizeof a->jobs / sizeof a->jobs[0]; i++) {
         Job *j = &a->jobs[i];
@@ -8394,6 +9252,25 @@ static int pump_events(App *a, int timeout_ms)
         nfds++;
     }
 
+    /* Keep pasting into other apps from blocking our Wayland event loop. */
+    for (ClipWrite *w = a->clip_writes; w && n_write_fds < 16; w = w->next) {
+        write_idx[n_write_fds++] = nfds;
+        fds[nfds].fd = w->fd;
+        fds[nfds].events = POLLOUT;
+        fds[nfds].revents = 0;
+        nfds++;
+    }
+
+    if (clip_idx >= 0) {
+        double left = a->clip_read.deadline - mono_sec();
+        int ms = left <= 0.0 ? 0 : (int)(left * 1000.0);
+        if (ms < timeout_ms || timeout_ms < 0) timeout_ms = ms;
+    }
+    if (a->xfer.active && a->xfer.show_pending) {
+        double left = a->xfer.show_at - mono_sec();
+        int ms = left <= 0.0 ? 0 : (int)(left * 1000.0);
+        if (ms < timeout_ms || timeout_ms < 0) timeout_ms = ms;
+    }
     int ret = poll(fds, (nfds_t)nfds, timeout_ms);
     if (ret < 0) return errno == EINTR ? 0 : -1;
 
@@ -8413,7 +9290,8 @@ static int pump_events(App *a, int timeout_ms)
         ctl_read_client(a);
 
     int first_job = 1 + (ctl_idx >= 0) + (client_idx >= 0) +
-                    (xfer_idx >= 0) + (thumb_idx >= 0) + (ino_idx >= 0);
+                    (xfer_idx >= 0) + (thumb_idx >= 0) + (ino_idx >= 0) +
+                    (clip_idx >= 0);
     for (int i = 0; i < n_job_fds; i++) {
         if (!(fds[first_job + i].revents & (POLLIN | POLLHUP | POLLERR)))
             continue;
@@ -8421,6 +9299,15 @@ static int pump_events(App *a, int timeout_ms)
     }
 
     xfer_poll(a);
+    xfer_window_maybe_open(a);
+    if (clip_idx >= 0 &&
+        (fds[clip_idx].revents || a->clip_read.fd >= 0))
+        clip_read_drain(a);
+    for (int i = 0; i < n_write_fds; i++) {
+        short re = fds[write_idx[i]].revents;
+        if (re & (POLLOUT | POLLERR | POLLHUP | POLLNVAL))
+            clip_write_poll(a, fds[write_idx[i]].fd);
+    }
     if (ino_idx >= 0 && (fds[ino_idx].revents &
                          (POLLIN | POLLERR | POLLHUP)))
         watch_drain(a);
@@ -8605,6 +9492,7 @@ int main(int argc, char **argv)
     app.ino_fd = app.ino_wd = -1;
     app.ctl_client_fd = -1;
     app.xfer.fd = -1;
+    app.clip_read.fd = -1;
     app.sel = -1;
     app.anchor = -1;
     app.sidebar_drive = -1;
