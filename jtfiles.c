@@ -12,6 +12,7 @@
  *
  * Controls:
  *   Click / double-click     select / open
+ *   Mount (polkit)           the drive opens automatically once mounted
  *   Right-click              Windows 10 classic context menu
  *   Ctrl+C / X / V           copy / cut / paste (progress window)
  *   Delete / F2              move to Trash / rename
@@ -46,6 +47,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <spawn.h>
 #include <stdatomic.h>
 #include <limits.h>
 #include <math.h>
@@ -66,6 +68,9 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+/* posix_spawn() takes the child environment explicitly. */
+extern char **environ;
 
 /* ------------------------------------------------------------------ */
 /*  Look & feel                                                        */
@@ -2337,7 +2342,12 @@ static void go_hist(App *a, int dir)
     snprintf(a->path_edit, sizeof a->path_edit, "%s", a->cwd);
 }
 
-/* ---- drives: lsblk for enumeration, udisksctl for mount operations - */
+/* ---- drives: lsblk for enumeration, udisksctl for mount operations ---
+ *
+ * Mount/unmount/eject are handed to an absolute udisksctl binary via
+ * posix_spawn().  No PATH lookup, and no fork() from our worker-threaded
+ * process; udisksd + polkit remain the only privileged components. */
+#define UDISKCTL_PATH "/usr/bin/udisksctl"
 
 /* lsblk -P prints KEY="value" pairs, and quoted values may contain spaces
  * (e.g. LABEL="New Volume" and MOUNTPOINT="/run/media/user/New Volume").
@@ -2486,28 +2496,37 @@ static void drive_job(App *a, Drive *d, int op)
     j->op = op;
     snprintf(j->dev, sizeof j->dev, "%s", d->dev);
 
+    char *args_mount[] = { (char *)UDISKCTL_PATH, (char *)"mount", (char *)"-b",
+                           j->dev, NULL };
+    char *args_unmount[] = { (char *)UDISKCTL_PATH, (char *)"unmount",
+                             (char *)"-b", j->dev, NULL };
+    char *args_eject[] = { (char *)UDISKCTL_PATH, (char *)"eject", (char *)"-b",
+                           j->dev, NULL };
+    char **av = op == 0 ? args_mount : (op == 1 ? args_unmount : args_eject);
+
     int p[2];
     if (pipe2(p, O_CLOEXEC) < 0) { status_set(a, "pipe failed: %s", strerror(errno)); return; }
-    pid_t pid = fork();
-    if (pid == 0) {
-        dup2(p[1], STDOUT_FILENO);
-        dup2(p[1], STDERR_FILENO);
-        close(p[0]);
-        close(p[1]);
-        char *args_mount[] = { (char *)"udisksctl", (char *)"mount", (char *)"-b",
-                               d->dev, NULL };
-        char *args_unmount[] = { (char *)"udisksctl", (char *)"unmount", (char *)"-b",
-                                 d->dev, NULL };
-        char *args_eject[] = { (char *)"udisksctl", (char *)"eject", (char *)"-b",
-                               d->dev, NULL };
-        char **av = op == 0 ? args_mount : (op == 1 ? args_unmount : args_eject);
-        execvp("udisksctl", av);
-        _exit(127);
+
+    /* posix_spawn instead of fork+exec: jtfiles has thumbnail worker threads,
+     * and the absolute binary path means no PATH lookup in the child. */
+    posix_spawn_file_actions_t fa;
+    pid_t pid = 0;
+    int rc = posix_spawn_file_actions_init(&fa);
+    if (rc == 0) {
+        rc = posix_spawn_file_actions_addclose(&fa, p[0]);
+        if (rc == 0) rc = posix_spawn_file_actions_adddup2(&fa, p[1], STDOUT_FILENO);
+        if (rc == 0) rc = posix_spawn_file_actions_adddup2(&fa, p[1], STDERR_FILENO);
+        if (rc == 0 && p[1] > STDERR_FILENO)
+            rc = posix_spawn_file_actions_addclose(&fa, p[1]);
+        if (rc == 0)
+            rc = posix_spawn(&pid, UDISKCTL_PATH, &fa, NULL, av, environ);
+        posix_spawn_file_actions_destroy(&fa);
     }
     close(p[1]);
-    if (pid < 0) {
+    if (rc != 0 || pid <= 0) {
         close(p[0]);
-        status_set(a, "Could not start udisksctl: %s", strerror(errno));
+        status_set(a, "Could not start %s: %s", UDISKCTL_PATH,
+                   rc ? strerror(rc) : "no child process");
         return;
     }
     int fl = fcntl(p[0], F_GETFL, 0);
@@ -2516,6 +2535,26 @@ static void drive_job(App *a, Drive *d, int op)
     j->fd = p[0];
     status_set(a, "%s %s…", op == 0 ? "Mounting" :
                (op == 1 ? "Unmounting" : "Ejecting"), d->dev);
+}
+
+/* udisksctl prints "Mounted /dev/sdX1 at /run/media/user/Label." when the
+ * polkit prompt is answered and the mount is live.  Prefer the refreshed
+ * Drive entry, but keep the printed path as a fallback since lsblk can lag
+ * behind by one poll interval. */
+static void mount_path_from_job(const char *buf, char *out, size_t cap)
+{
+    *out = '\0';
+    const char *at = strstr(buf, " at ");
+    if (!at) return;
+    at += 4;
+    const char *end = at;
+    while (*end && *end != '\n' && *end != '\r') end++;
+    while (end > at && (end[-1] == '.' || end[-1] == ' ' || end[-1] == '\t'))
+        end--;
+    size_t n = (size_t)(end - at);
+    if (!n || n >= cap) return;
+    memcpy(out, at, n);
+    out[n] = '\0';
 }
 
 static void job_finish(App *a, Job *j, int code)
@@ -2531,6 +2570,24 @@ static void job_finish(App *a, Job *j, int code)
     j->pid = 0;
     j->len = 0;
     drive_refresh(a);
+
+    /* Mounting goes through polkit, so the user may have answered the prompt
+     * a while ago.  Once udisksctl confirms the mount, open the drive without
+     * making them click it a second time. */
+    if (j->op == 0 && code == 0) {
+        char path[PATH_MAX] = "";
+        for (int i = 0; i < a->n_drives; i++) {
+            Drive *d = &a->drives[i];
+            if (!strcmp(d->dev, j->dev) && d->mounted && d->mount[0]) {
+                snprintf(path, sizeof path, "%s", d->mount);
+                break;
+            }
+        }
+        if (!path[0]) mount_path_from_job(j->buf, path, sizeof path);
+        struct stat st;
+        if (path[0] && stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+            navigate(a, path, 1);
+    }
 }
 
 /* ---- generic background launch ------------------------------------ */
