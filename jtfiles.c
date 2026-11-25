@@ -57,6 +57,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -94,6 +95,9 @@
 #define SEL_LAP_WIDTH    3.0
 #define SEL_LAP_MIN_SEG  14.0
 #define SEL_LAP_MAX_SEG  48.0
+
+/* Shared appearance toggle for the accent-border laps (see jtlabwc). */
+#define APPEARANCE_CONFIG "appearance.conf"
 
 #define ICON_CACHE_MAX 192
 #define THUMB_CACHE_MAX 48
@@ -1516,6 +1520,8 @@ struct App {
     char post_dir[PATH_MAX];
     char post_names[64][NAME_MAX + 1];
     int n_post_names, post_armed;
+    /* Shared appearance.conf toggle for all accent-border laps. */
+    int border_anim_enabled;
     /* >0: lap running; -1: lap already played for this batch. */
     double post_sel_anim_start;
     char *hist[64];
@@ -1808,7 +1814,7 @@ static void apply_post_xfer_selection(App *a)
             a->sel = a->anchor = first;
             scroll_index_into_view(a, first);
         }
-        if (a->post_sel_anim_start == 0.0)
+        if (a->border_anim_enabled && a->post_sel_anim_start == 0.0)
             a->post_sel_anim_start = mono_sec();
         a->dirty = 1;
     }
@@ -1816,7 +1822,8 @@ static void apply_post_xfer_selection(App *a)
 
 static int post_sel_entry_pending(const App *a, int idx)
 {
-    if (!a || !a->post_armed || !a->selected || idx < 0 || idx >= a->n_ents)
+    if (!a || !a->border_anim_enabled || !a->post_armed || !a->selected ||
+        idx < 0 || idx >= a->n_ents)
         return 0;
     if (a->post_sel_anim_start <= 0.0) return 0;
     for (int k = 0; k < a->n_post_names; k++)
@@ -1832,13 +1839,15 @@ static double post_sel_elapsed_ms(const App *a)
 
 static int post_sel_anim_active(const App *a)
 {
-    return post_sel_elapsed_ms(a) < SEL_LAP_MS;
+    return a && a->border_anim_enabled &&
+           post_sel_elapsed_ms(a) < SEL_LAP_MS;
 }
 
 /* Mark a repaint each tick and retire the batch once the lap completes. */
 static int post_sel_anim_tick(App *a)
 {
-    if (!a || a->post_sel_anim_start <= 0.0) return 0;
+    if (!a || !a->border_anim_enabled || a->post_sel_anim_start <= 0.0)
+        return 0;
     if (post_sel_elapsed_ms(a) > SEL_LAP_MS)
         a->post_sel_anim_start = -1;
     a->dirty = 1;
@@ -3704,7 +3713,7 @@ static void popup_configure(void *data, struct xdg_popup *popup,
 {
     (void)popup; (void)x; (void)y; (void)w; (void)h;
     Menu *m = data;
-    if (!m->configured) {
+    if (!m->configured && m->app && m->app->border_anim_enabled) {
         m->popup_anim_start = mono_sec();
         m->popup_anim_active = 1;
     }
@@ -4046,7 +4055,8 @@ static void action_activate(App *a, int id)
         for (int i = 0; i < arm_n; i++)
             snprintf(paths[i], PATH_MAX, "%s", a->clipboard[i]);
         post_xfer_arm(a, a->cwd, paths, arm_n);
-        if (a->post_armed) a->post_sel_anim_start = mono_sec();
+        if (a->border_anim_enabled && a->post_armed)
+            a->post_sel_anim_start = mono_sec();
         break;
     }
     case A_COPY_PATH:
@@ -5314,7 +5324,8 @@ static double menu_popup_elapsed_ms(const Menu *m)
 
 static int menu_popup_anim_active(const Menu *m)
 {
-    return m && m->popup_anim_active && menu_popup_elapsed_ms(m) < SEL_LAP_MS;
+    return m && m->app && m->app->border_anim_enabled &&
+           m->popup_anim_active && menu_popup_elapsed_ms(m) < SEL_LAP_MS;
 }
 
 static void menu_tree_tick(Menu *m, double now)
@@ -5712,9 +5723,16 @@ static void menu_paint(App *a, Menu *m, ShmBuf *b)
     int popup_lap = menu_popup_anim_active(m);
     double popup_progress = popup_lap ? popup_ms / SEL_LAP_MS : 1.0;
 
+    /* Clip the offset shadow to the panel path: otherwise it fills the
+     * transparent wedges outside the bottom rounded corners, which show up
+     * as black artifacts under the popup. */
+    cairo_save(cr);
+    rounded_rect(cr, 0.0, 0.0, m->w, m->h, 8.0);
+    cairo_clip(cr);
     cairo_set_source_rgba(cr, 0, 0, 0, 0.45);
     rounded_rect(cr, 2.0, 4.0, m->w, m->h, 8.0);
     cairo_fill(cr);
+    cairo_restore(cr);
     cairo_pattern_t *g = cairo_pattern_create_linear(0, 0, 0, m->h);
     cairo_pattern_add_color_stop_rgba(g, 0, R_(0x1A1B1D), G_(0x1A1B1D),
                                       B_(0x1A1B1D), 0.98);
@@ -9083,6 +9101,74 @@ static int wayland_start(App *a)
     return 1;
 }
 
+/* Stop any in-flight laps when the shared toggle is switched off. */
+static void appearance_menu_stop_lap(Menu *m)
+{
+    if (!m) return;
+    m->popup_anim_active = 0;
+    m->popup_anim_start = 0.0;
+    m->dirty = 1;
+    for (int i = 0; i < m->n; i++)
+        appearance_menu_stop_lap(m->items[i].sub);
+}
+
+static int appearance_config_bool(const char *value)
+{
+    if (!strcasecmp(value, "true")) return 1;
+    if (!strcasecmp(value, "false")) return 0;
+    return 0; /* off unless explicitly enabled, as in jtlabwc */
+}
+
+/* Read ~/.config/jt/appearance.conf with the same keys and default as
+ * jtlabwc: a bare true/false, or accent_border_animation / the legacy
+ * jtlabwc_border_anim_enabled key.  Off when unset. */
+static void appearance_config_load(App *a)
+{
+    a->border_anim_enabled = 0;
+    const char *home = getenv("HOME");
+    if (!home || !*home) return;
+    char path[512];
+    snprintf(path, sizeof path, "%s/.config/jt/%s", home, APPEARANCE_CONFIG);
+    FILE *file = fopen(path, "r");
+    if (!file) return;
+    char line[256];
+    while (fgets(line, sizeof line, file)) {
+        char *text = line;
+        while (*text == ' ' || *text == '\t') text++;
+        char *end = text + strlen(text);
+        while (end > text && (end[-1] == '\n' || end[-1] == '\r' ||
+                              end[-1] == ' ' || end[-1] == '\t')) {
+            *--end = '\0';
+        }
+        if (!*text || *text == '#') continue;
+        char *key = "";
+        char *value = text;
+        char *equals = strchr(text, '=');
+        if (equals) {
+            *equals = '\0';
+            key = text;
+            value = equals + 1;
+            char *key_end = key + strlen(key);
+            while (key_end > key && (key_end[-1] == ' ' ||
+                                     key_end[-1] == '\t')) {
+                *--key_end = '\0';
+            }
+            while (*value == ' ' || *value == '\t') value++;
+        }
+        if (!*value) continue;
+        if (!*key || !strcmp(key, "accent_border_animation") ||
+            !strcmp(key, "jtlabwc_border_anim_enabled")) {
+            a->border_anim_enabled = appearance_config_bool(value);
+        }
+    }
+    fclose(file);
+    if (!a->border_anim_enabled) {
+        a->post_sel_anim_start = -1;
+        appearance_menu_stop_lap(a->menu);
+        a->dirty = 1;
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /*  Live control socket                                                */
 /* ------------------------------------------------------------------ */
@@ -9101,6 +9187,7 @@ static void ctl_handle_line(App *a, char *line)
     while (n && (line[n - 1] == ' ' || line[n - 1] == '\t' ||
                  line[n - 1] == '\r' || line[n - 1] == '\n')) line[--n] = '\0';
     if (!strcmp(line, "quit")) { a->quit = 1; return; }
+    if (!strcmp(line, "reload")) { appearance_config_load(a); return; }
     if (!strncmp(line, "accent", 6) && (line[6] == ' ' || line[6] == '\t')) {
         const char *arg = line + 6;
         while (*arg == ' ' || *arg == '\t') arg++;
@@ -9704,6 +9791,7 @@ int main(int argc, char **argv)
     app.pointer_y = -1.0;
     app.last_click_t = 0.0;
     app.last_click_row = -1;
+    app.border_anim_enabled = 0;
     app.ctx_kind = CTX_NONE;
     g_app_signal = &app;
 
@@ -9747,6 +9835,7 @@ int main(int argc, char **argv)
     snprintf(app.cwd, sizeof app.cwd, "%s", cwd);
     snprintf(app.path_edit, sizeof app.path_edit, "%s", start);
 
+    appearance_config_load(&app);
     if (!wayland_start(&app)) {
         app_cleanup(&app);
         return 1;
