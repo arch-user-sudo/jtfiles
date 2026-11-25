@@ -6437,9 +6437,8 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
             menu_clear_children(m);
             m->hover = hit;
             m->dirty = 1;
-            if (hit >= 0 && m->items[hit].kind == 2 && m->items[hit].enabled &&
-                !m->items[hit].sub)
-                menu_build_sub(a, m, hit, a->pointer_serial);
+            /* Submenus are click-to-open; hover only changes selection and
+             * menu_clear_children() closes any submenu we just left. */
         }
     } else if (a->pointer_target == 1) {
         if (a->sb_drag) {
