@@ -33,6 +33,7 @@
 
 #include <cairo/cairo.h>
 #include <pango/pangocairo.h>
+#include <udisks/udisks.h>
 
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
@@ -47,7 +48,6 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
-#include <spawn.h>
 #include <stdatomic.h>
 #include <limits.h>
 #include <math.h>
@@ -68,9 +68,6 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
-
-/* posix_spawn() takes the child environment explicitly. */
-extern char **environ;
 
 /* ------------------------------------------------------------------ */
 /*  Look & feel                                                        */
@@ -1261,6 +1258,8 @@ typedef struct {
     char fstype[32];
     char model[160];
     char avail[64];
+    char object[160];           /* UDisks2 block object path */
+    char drive_object[160];     /* UDisks2 drive object path */
     int removable, mounted, is_optical;
     double used;
     char icon[64];
@@ -1330,13 +1329,19 @@ typedef struct {
     int cursor;
 } Dialog;
 
+/* One asynchronous udisks2 operation. Callbacks run in our GMainContext and
+ * only flip `done`; the Wayland loop finishes the job on the next tick. */
 typedef struct {
-    pid_t pid;
-    int fd;
+    App *app;
     char dev[80];
-    char buf[4096];
-    size_t len;
-    int op; /* 0 mount, 1 unmount, 2 eject */
+    char object[160];           /* stable UDisks2 block object path */
+    char drive_object[160];     /* stable UDisks2 drive object path */
+    char mount[PATH_MAX];
+    char result[512];
+    gpointer proxy;             /* UDisksFilesystem or UDisksDrive ref */
+    GCancellable *cancel;
+    int op;                     /* 0 mount, 1 unmount, 2 eject */
+    int active, done, code;
 } Job;
 
 /* One live copy/move/trash/delete operation and its themed progress window. */
@@ -1551,9 +1556,14 @@ struct App {
     unsigned char *selected;
     int n_selected;
 
+    UDisksClient *udisks;
+    GMainContext *dbus_ctx;
+    int drives_dirty;           /* set by UDisks2 signals */
+
     Drive drives[48];
     int n_drives;
     int sidebar_drive;
+    char sidebar_drive_dev[80]; /* stable identity for the highlighted row */
     int drives_y0;
     double last_click_t;
     int last_click_row;
@@ -2342,251 +2352,344 @@ static void go_hist(App *a, int dir)
     snprintf(a->path_edit, sizeof a->path_edit, "%s", a->cwd);
 }
 
-/* ---- drives: lsblk for enumeration, udisksctl for mount operations ---
+/* ---- drives: libudisks2 for enumeration and mount operations ---------
  *
- * Mount/unmount/eject are handed to an absolute udisksctl binary via
- * posix_spawn().  No PATH lookup, and no fork() from our worker-threaded
- * process; udisksd + polkit remain the only privileged components. */
-#define UDISKCTL_PATH "/usr/bin/udisksctl"
-
-/* lsblk -P prints KEY="value" pairs, and quoted values may contain spaces
- * (e.g. LABEL="New Volume" and MOUNTPOINT="/run/media/user/New Volume").
- * Splitting that line on spaces truncates the mount path at the first space,
- * which is why clicking such a drive tried to open "New". Parse the quotes
- * properly, including lsblk's backslash escapes (\" \\ and \xNN). */
-static int lsblk_next_kv(char **cursor, char *key, size_t kcap,
-                         char *val, size_t vcap)
+ * No lsblk parsing and no process spawn. UDisksClient gives us stable object
+ * paths, D-Bus change signals and async mount/unmount/eject calls; the
+ * privileged work still happens in udisksd behind polkit. */
+static void drives_changed_cb(GDBusObjectManager *manager,
+                              GDBusObject *object, gpointer user_data)
 {
-    char *p = *cursor;
-    while (*p == ' ' || *p == '\t' || *p == '\n') p++;
-    if (!*p) { *cursor = p; return 0; }
+    (void)manager; (void)object;
+    App *a = user_data;
+    if (!a) return;
+    a->drives_dirty = 1;
+    a->dirty = 1;
+}
 
-    size_t kn = 0;
-    while (*p && *p != '=') {
-        if (kn + 1 < kcap) key[kn++] = *p;
-        p++;
-    }
-    key[kn] = '\0';
-    if (*p != '=') { *cursor = p; return 0; }
-    p++;
-    if (*p != '"') { *cursor = p; return 0; }
-    p++;
+static void drives_iface_cb(GDBusObjectManager *manager, GDBusObject *object,
+                            GDBusInterface *interface, gpointer user_data)
+{
+    (void)manager; (void)object; (void)interface;
+    App *a = user_data;
+    if (!a) return;
+    a->drives_dirty = 1;
+    a->dirty = 1;
+}
 
-    size_t vn = 0;
-    while (*p && *p != '"') {
-        char c = *p++;
-        if (c == '\\' && *p) {
-            c = *p++;
-            if (c == 'x' && isxdigit((unsigned char)p[0]) &&
-                isxdigit((unsigned char)p[1])) {
-                char hex[3] = { p[0], p[1], '\0' };
-                c = (char)strtol(hex, NULL, 16);
-                p += 2;
-            }
-        }
-        if (vn + 1 < vcap) val[vn++] = c;
+static void drives_props_changed_cb(GDBusObjectManagerClient *manager,
+                                    GDBusObjectProxy *object_proxy,
+                                    GDBusProxy *interface_proxy,
+                                    GVariant *changed_properties,
+                                    const gchar *const *invalidated_properties,
+                                    gpointer user_data)
+{
+    (void)manager; (void)object_proxy; (void)interface_proxy;
+    (void)changed_properties; (void)invalidated_properties;
+    App *a = user_data;
+    if (!a) return;
+    a->drives_dirty = 1;
+    a->dirty = 1;
+}
+
+static void udisks_init(App *a)
+{
+    a->dbus_ctx = g_main_context_new();
+    /* UDisksClient and its proxies attach to the thread-default context. */
+    g_main_context_push_thread_default(a->dbus_ctx);
+
+    GError *err = NULL;
+    a->udisks = udisks_client_new_sync(NULL, &err);
+    if (!a->udisks) {
+        fprintf(stderr, "jtfiles: udisks2 unavailable: %s\n",
+                err ? err->message : "unknown error");
+        if (err) g_error_free(err);
+        return;
     }
-    if (*p == '"') p++;
-    val[vn] = '\0';
-    *cursor = p;
-    return 1;
+
+    GDBusObjectManager *om = udisks_client_get_object_manager(a->udisks);
+    if (om) {
+        g_signal_connect(om, "object-added",
+                         G_CALLBACK(drives_changed_cb), a);
+        g_signal_connect(om, "object-removed",
+                         G_CALLBACK(drives_changed_cb), a);
+        g_signal_connect(om, "interface-added",
+                         G_CALLBACK(drives_iface_cb), a);
+        g_signal_connect(om, "interface-removed",
+                         G_CALLBACK(drives_iface_cb), a);
+        g_signal_connect(om, "interface-proxy-properties-changed",
+                         G_CALLBACK(drives_props_changed_cb), a);
+    }
+    /* UDisksClient may already have queued changes before we connected. */
+    a->drives_dirty = 1;
 }
 
 static void drive_refresh(App *a)
 {
     a->n_drives = 0;
-    FILE *f = popen("lsblk -p -P -o NAME,LABEL,TYPE,SIZE,MOUNTPOINT,RM,"
-                    "TRAN,FSTYPE,VENDOR,MODEL 2>/dev/null", "r");
-    if (!f) return;
-    char line[1024];
-    while (fgets(line, sizeof line, f)) {
-        if (a->n_drives >= 48) break;
-        char dev[128] = "", label[128] = "", type[32] = "", size[32] = "";
-        char mount[PATH_MAX] = "", rm[16] = "", tran[32] = "";
-        char fs[32] = "", vendor[80] = "", model[128] = "";
-        char *cur = line, key[32], value[PATH_MAX];
-        while (lsblk_next_kv(&cur, key, sizeof key, value, sizeof value)) {
-            if (!strcmp(key, "NAME")) snprintf(dev, sizeof dev, "%s", value);
-            else if (!strcmp(key, "LABEL")) snprintf(label, sizeof label, "%s", value);
-            else if (!strcmp(key, "TYPE")) snprintf(type, sizeof type, "%s", value);
-            else if (!strcmp(key, "SIZE")) snprintf(size, sizeof size, "%s", value);
-            else if (!strcmp(key, "MOUNTPOINT")) snprintf(mount, sizeof mount, "%s", value);
-            else if (!strcmp(key, "RM")) snprintf(rm, sizeof rm, "%s", value);
-            else if (!strcmp(key, "TRAN")) snprintf(tran, sizeof tran, "%s", value);
-            else if (!strcmp(key, "FSTYPE")) snprintf(fs, sizeof fs, "%s", value);
-            else if (!strcmp(key, "VENDOR")) snprintf(vendor, sizeof vendor, "%s", value);
-            else if (!strcmp(key, "MODEL")) snprintf(model, sizeof model, "%s", value);
-        }
-        int is_disk = !strcmp(type, "disk");
-        int is_part = !strcmp(type, "part");
-        int is_volume = !strcmp(type, "lvm") || !strcmp(type, "crypt") ||
-                        !strcmp(type, "zfs") || !strncmp(type, "raid", 4) ||
-                        !strncmp(type, "md", 2);
-        int is_swap = !strcmp(fs, "swap") || !strcmp(mount, "[SWAP]");
-        int is_optical = strstr(dev, "/sr") != NULL ||
-                         strstr(dev, "/cdrom") != NULL;
-        int removable = !strcmp(rm, "1") || !strcmp(tran, "usb");
-        int mounted = mount[0] && !is_swap;
+    GDBusObjectManager *om = a->udisks ?
+                             udisks_client_get_object_manager(a->udisks) : NULL;
+    GList *objects = om ? g_dbus_object_manager_get_objects(om) : NULL;
 
-        /* This PC should list every volume, mounted or not.  Previously only
-         * partitions with a detected filesystem or mountpoint were shown,
-         * so spare/unformatted partitions on internal disks were invisible.
-         * Whole disks are only listed when they are themselves usable media
-         * (removable/optical or carrying a filesystem directly), which keeps
-         * the sidebar from duplicating each partition under its parent disk. */
-        if (is_swap) continue;
-        if (is_disk) {
-            if (!(removable || is_optical || (fs[0] && mounted))) continue;
-        } else if (!is_part && !is_volume) {
+    for (GList *l = objects; l && a->n_drives < 48; l = l->next) {
+        UDisksObject *obj = UDISKS_OBJECT(l->data);
+        UDisksBlock *block = udisks_object_peek_block(obj);
+        if (!block || udisks_block_get_hint_ignore(block)) continue;
+        if (udisks_object_peek_loop(obj) || udisks_object_peek_swapspace(obj))
+            continue;
+
+        const char *dev = udisks_block_get_device(block);
+        if (!dev || !*dev || dev[0] != '/') continue;
+
+        const char *fstype = udisks_block_get_id_type(block);
+        if (fstype && !strcmp(fstype, "swap")) continue;
+
+        UDisksFilesystem *fs = udisks_object_peek_filesystem(obj);
+        int is_part = udisks_object_peek_partition(obj) != NULL;
+        int is_volume = udisks_object_peek_encrypted(obj) != NULL ||
+                        udisks_object_peek_mdraid(obj) != NULL;
+
+        UDisksDrive *drive = a->udisks ?
+                             udisks_client_get_drive_for_block(a->udisks, block) : NULL;
+        int removable = drive && (udisks_drive_get_removable(drive) ||
+                                  udisks_drive_get_media_removable(drive));
+        int is_optical = drive && udisks_drive_get_optical(drive);
+        if (strstr(dev, "/sr") || strstr(dev, "/cdrom")) is_optical = 1;
+
+        /* Keep every volume (mounted or not).  A whole disk is only useful
+         * here if it is removable/optical or holds a filesystem directly. */
+        if (!is_part && !is_volume && !fs && !(removable || is_optical)) {
+            if (drive) g_object_unref(drive);
             continue;
         }
-        if (dev[0] != '/') continue;
+
+        const char *const *mps = fs ? udisks_filesystem_get_mount_points(fs) : NULL;
+        const char *mount = mps && mps[0] ? mps[0] : "";
+        int mounted = mount[0] != '\0';
+
         Drive *d = &a->drives[a->n_drives++];
         memset(d, 0, sizeof *d);
         snprintf(d->dev, sizeof d->dev, "%s", dev);
-        snprintf(d->label, sizeof d->label, "%s", label);
+        snprintf(d->object, sizeof d->object, "%s",
+                 g_dbus_proxy_get_object_path(G_DBUS_PROXY(block)));
+        if (drive)
+            snprintf(d->drive_object, sizeof d->drive_object, "%s",
+                     g_dbus_proxy_get_object_path(G_DBUS_PROXY(drive)));
+
+        const char *label = udisks_block_get_id_label(block);
+        snprintf(d->label, sizeof d->label, "%s", label ? label : "");
         if (!d->label[0] && mounted && strcmp(mount, "/"))
             snprintf(d->label, sizeof d->label, "%s", base_name(mount));
         if (!d->label[0])
             snprintf(d->label, sizeof d->label, "%s",
                      removable ? "Removable Disk" : "Local Disk");
+
         snprintf(d->mount, sizeof d->mount, "%s", mount);
-        snprintf(d->size, sizeof d->size, "%s", size);
-        snprintf(d->fstype, sizeof d->fstype, "%s", fs);
-        snprintf(d->model, sizeof d->model, "%s", model[0] ? model : vendor);
+        snprintf(d->fstype, sizeof d->fstype, "%s", fstype ? fstype : "");
+        if (drive) {
+            const char *model = udisks_drive_get_model(drive);
+            const char *vendor = udisks_drive_get_vendor(drive);
+            snprintf(d->model, sizeof d->model, "%s",
+                     model && *model ? model : (vendor ? vendor : ""));
+            g_object_unref(drive);
+        }
+        char size_buf[64];
+        fmt_size(size_buf, sizeof size_buf,
+                 (off_t)udisks_block_get_size(block));
+        snprintf(d->size, sizeof d->size, "%s", size_buf);
         d->removable = removable;
         d->is_optical = is_optical;
         d->mounted = mounted;
-        if (d->is_optical) snprintf(d->icon, sizeof d->icon, "%s", "drive-optical");
-        else if (d->removable) snprintf(d->icon, sizeof d->icon, "%s",
-                                        "drive-removable-media-usb");
-        else snprintf(d->icon, sizeof d->icon, "%s", "drive-harddisk");
-        if (d->mounted) {
+        if (d->is_optical)
+            snprintf(d->icon, sizeof d->icon, "%s", "drive-optical");
+        else if (d->removable)
+            snprintf(d->icon, sizeof d->icon, "%s", "drive-removable-media-usb");
+        else
+            snprintf(d->icon, sizeof d->icon, "%s", "drive-harddisk");
+
+        if (mounted) {
             struct statvfs sv;
             if (statvfs(mount, &sv) == 0 && sv.f_blocks > 0) {
                 d->used = 1.0 - (double)sv.f_bavail / (double)sv.f_blocks;
                 char buf[64];
-                fmt_size(buf, sizeof buf, (off_t)sv.f_bavail * (off_t)sv.f_frsize);
+                fmt_size(buf, sizeof buf,
+                         (off_t)sv.f_bavail * (off_t)sv.f_frsize);
                 snprintf(d->avail, sizeof d->avail, "%s free", buf);
             }
         }
     }
-    pclose(f);
-    if (a->sidebar_drive >= a->n_drives) a->sidebar_drive = -1;
+    if (objects) g_list_free_full(objects, g_object_unref);
+
+    /* Sidebar highlight is stored by device, not by row number. */
+    a->sidebar_drive = -1;
+    if (a->sidebar_drive_dev[0]) {
+        for (int i = 0; i < a->n_drives; i++) {
+            if (!strcmp(a->drives[i].dev, a->sidebar_drive_dev)) {
+                a->sidebar_drive = i;
+                break;
+            }
+        }
+        if (a->ctx_kind == CTX_DRIVE) a->ctx_index = a->sidebar_drive;
+    }
     a->dirty = 1;
 }
 
-static void job_finish(App *a, Job *j, int code);
+static void job_release(Job *j)
+{
+    if (j->proxy) { g_object_unref(j->proxy); j->proxy = NULL; }
+    if (j->cancel) { g_object_unref(j->cancel); j->cancel = NULL; }
+    j->active = 0;
+    j->done = 0;
+}
+
+static void drive_op_done(GObject *source, GAsyncResult *result, gpointer data)
+{
+    Job *j = data;
+    GError *err = NULL;
+    j->code = 1;
+
+    if (j->op == 0) {
+        gchar *path = NULL;
+        if (udisks_filesystem_call_mount_finish(UDISKS_FILESYSTEM(source),
+                                                &path, result, &err)) {
+            j->code = 0;
+            if (path) {
+                snprintf(j->mount, sizeof j->mount, "%s", path);
+                snprintf(j->result, sizeof j->result, "Mounted %s at %s",
+                         j->dev, path);
+            } else {
+                snprintf(j->result, sizeof j->result, "Mounted %s", j->dev);
+            }
+        }
+        if (path) g_free(path);
+    } else if (j->op == 1) {
+        if (udisks_filesystem_call_unmount_finish(UDISKS_FILESYSTEM(source),
+                                                  result, &err)) {
+            j->code = 0;
+            snprintf(j->result, sizeof j->result, "Unmounted %s", j->dev);
+        }
+    } else {
+        if (udisks_drive_call_eject_finish(UDISKS_DRIVE(source),
+                                           result, &err)) {
+            j->code = 0;
+            snprintf(j->result, sizeof j->result, "Ejected %s", j->dev);
+        }
+    }
+
+    if (err) {
+        snprintf(j->result, sizeof j->result, "%s", err->message);
+        g_error_free(err);
+    }
+    j->active = 0;
+    j->done = 1;
+    if (j->app) {
+        j->app->drives_dirty = 1;
+        j->app->dirty = 1;
+    }
+}
+
+static void job_finish(App *a, Job *j)
+{
+    char msg[512];
+    snprintf(msg, sizeof msg, "%s", j->result);
+    if (!msg[0]) snprintf(msg, sizeof msg, "%s", j->code ? "Failed" : "Done");
+    status_set(a, "%s: %s", j->dev, msg);
+    drive_refresh(a);
+
+    /* Polkit may hold the mount call for a while. Once udisksd confirms it,
+     * open the drive without making the user click it a second time. */
+    if (j->op == 0 && j->code == 0) {
+        char path[PATH_MAX] = "";
+        for (int i = 0; i < a->n_drives; i++) {
+            Drive *d = &a->drives[i];
+            if (d->object[0] && j->object[0] && !strcmp(d->object, j->object) &&
+                d->mounted && d->mount[0]) {
+                snprintf(path, sizeof path, "%s", d->mount);
+                break;
+            }
+        }
+        if (!path[0] && j->mount[0])
+            snprintf(path, sizeof path, "%s", j->mount);
+        struct stat st;
+        if (path[0] && stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+            navigate(a, path, 1);
+    }
+    job_release(j);
+}
 
 static void drive_job(App *a, Drive *d, int op)
 {
+    if (!a->udisks) { status_set(a, "udisks2 is unavailable"); return; }
+
     for (unsigned i = 0; i < sizeof a->jobs / sizeof a->jobs[0]; i++) {
         Job *j = &a->jobs[i];
-        if (j->pid > 0 && !strcmp(j->dev, d->dev)) {
+        if (j->active && d->object[0] && !strcmp(j->object, d->object)) {
             status_set(a, "Already working on %s", d->dev);
             return;
         }
     }
     int idx = -1;
-    for (unsigned i = 0; i < sizeof a->jobs / sizeof a->jobs[0]; i++)
-        if (a->jobs[i].pid == 0) { idx = (int)i; break; }
+    for (unsigned i = 0; i < sizeof a->jobs / sizeof a->jobs[0]; i++) {
+        if (!a->jobs[i].active && !a->jobs[i].proxy) { idx = (int)i; break; }
+    }
     if (idx < 0) { status_set(a, "Too many pending drive operations"); return; }
+
     Job *j = &a->jobs[idx];
     memset(j, 0, sizeof *j);
+    j->app = a;
     j->op = op;
     snprintf(j->dev, sizeof j->dev, "%s", d->dev);
+    snprintf(j->object, sizeof j->object, "%s", d->object);
+    snprintf(j->drive_object, sizeof j->drive_object, "%s", d->drive_object);
 
-    char *args_mount[] = { (char *)UDISKCTL_PATH, (char *)"mount", (char *)"-b",
-                           j->dev, NULL };
-    char *args_unmount[] = { (char *)UDISKCTL_PATH, (char *)"unmount",
-                             (char *)"-b", j->dev, NULL };
-    char *args_eject[] = { (char *)UDISKCTL_PATH, (char *)"eject", (char *)"-b",
-                           j->dev, NULL };
-    char **av = op == 0 ? args_mount : (op == 1 ? args_unmount : args_eject);
-
-    int p[2];
-    if (pipe2(p, O_CLOEXEC) < 0) { status_set(a, "pipe failed: %s", strerror(errno)); return; }
-
-    /* posix_spawn instead of fork+exec: jtfiles has thumbnail worker threads,
-     * and the absolute binary path means no PATH lookup in the child. */
-    posix_spawn_file_actions_t fa;
-    pid_t pid = 0;
-    int rc = posix_spawn_file_actions_init(&fa);
-    if (rc == 0) {
-        rc = posix_spawn_file_actions_addclose(&fa, p[0]);
-        if (rc == 0) rc = posix_spawn_file_actions_adddup2(&fa, p[1], STDOUT_FILENO);
-        if (rc == 0) rc = posix_spawn_file_actions_adddup2(&fa, p[1], STDERR_FILENO);
-        if (rc == 0 && p[1] > STDERR_FILENO)
-            rc = posix_spawn_file_actions_addclose(&fa, p[1]);
-        if (rc == 0)
-            rc = posix_spawn(&pid, UDISKCTL_PATH, &fa, NULL, av, environ);
-        posix_spawn_file_actions_destroy(&fa);
+    /* The proxy refs are passed to the callbacks via j->proxy and held until
+     * job_finish(), so the object stays alive while polkit is prompting. */
+    if (op == 0 || op == 1) {
+        UDisksObject *obj = udisks_client_get_object(a->udisks, d->object);
+        if (obj) {
+            j->proxy = udisks_object_get_filesystem(obj);
+            g_object_unref(obj);
+        }
+        if (!j->proxy) {
+            status_set(a, "%s has no filesystem to %s", d->dev,
+                       op == 0 ? "mount" : "unmount");
+            return;
+        }
+    } else {
+        UDisksObject *obj = udisks_client_get_object(a->udisks,
+                                                      d->drive_object);
+        if (obj) {
+            j->proxy = udisks_object_get_drive(obj);
+            g_object_unref(obj);
+        }
+        if (!j->proxy) {
+            status_set(a, "%s cannot be ejected", d->dev);
+            return;
+        }
     }
-    close(p[1]);
-    if (rc != 0 || pid <= 0) {
-        close(p[0]);
-        status_set(a, "Could not start %s: %s", UDISKCTL_PATH,
-                   rc ? strerror(rc) : "no child process");
-        return;
-    }
-    int fl = fcntl(p[0], F_GETFL, 0);
-    fcntl(p[0], F_SETFL, fl | O_NONBLOCK);
-    j->pid = pid;
-    j->fd = p[0];
+
+    j->cancel = g_cancellable_new();
+    j->active = 1;
+    GVariant *opts = g_variant_new("a{sv}", NULL); /* floating, consumed by call */
     status_set(a, "%s %s…", op == 0 ? "Mounting" :
                (op == 1 ? "Unmounting" : "Ejecting"), d->dev);
+
+    if (op == 0)
+        udisks_filesystem_call_mount(UDISKS_FILESYSTEM(j->proxy), opts,
+                                     j->cancel, drive_op_done, j);
+    else if (op == 1)
+        udisks_filesystem_call_unmount(UDISKS_FILESYSTEM(j->proxy), opts,
+                                       j->cancel, drive_op_done, j);
+    else
+        udisks_drive_call_eject(UDISKS_DRIVE(j->proxy), opts,
+                                j->cancel, drive_op_done, j);
 }
 
-/* udisksctl prints "Mounted /dev/sdX1 at /run/media/user/Label." when the
- * polkit prompt is answered and the mount is live.  Prefer the refreshed
- * Drive entry, but keep the printed path as a fallback since lsblk can lag
- * behind by one poll interval. */
-static void mount_path_from_job(const char *buf, char *out, size_t cap)
+static void jobs_dispatch(App *a)
 {
-    *out = '\0';
-    const char *at = strstr(buf, " at ");
-    if (!at) return;
-    at += 4;
-    const char *end = at;
-    while (*end && *end != '\n' && *end != '\r') end++;
-    while (end > at && (end[-1] == '.' || end[-1] == ' ' || end[-1] == '\t'))
-        end--;
-    size_t n = (size_t)(end - at);
-    if (!n || n >= cap) return;
-    memcpy(out, at, n);
-    out[n] = '\0';
-}
-
-static void job_finish(App *a, Job *j, int code)
-{
-    char msg[512];
-    snprintf(msg, sizeof msg, "%s", j->buf);
-    char *nl = strrchr(msg, '\n');
-    if (nl && nl[1]) memmove(nl, nl + 1, strlen(nl + 1) + 1);
-    if (!msg[0]) snprintf(msg, sizeof msg, "%s", code == 0 ? "Done" : "Failed");
-    status_set(a, "%s: %s", j->dev, msg);
-    close(j->fd);
-    j->fd = -1;
-    j->pid = 0;
-    j->len = 0;
-    drive_refresh(a);
-
-    /* Mounting goes through polkit, so the user may have answered the prompt
-     * a while ago.  Once udisksctl confirms the mount, open the drive without
-     * making them click it a second time. */
-    if (j->op == 0 && code == 0) {
-        char path[PATH_MAX] = "";
-        for (int i = 0; i < a->n_drives; i++) {
-            Drive *d = &a->drives[i];
-            if (!strcmp(d->dev, j->dev) && d->mounted && d->mount[0]) {
-                snprintf(path, sizeof path, "%s", d->mount);
-                break;
-            }
-        }
-        if (!path[0]) mount_path_from_job(j->buf, path, sizeof path);
-        struct stat st;
-        if (path[0] && stat(path, &st) == 0 && S_ISDIR(st.st_mode))
-            navigate(a, path, 1);
+    for (unsigned i = 0; i < sizeof a->jobs / sizeof a->jobs[0]; i++) {
+        Job *j = &a->jobs[i];
+        if (j->active && j->done) job_finish(a, j);
     }
 }
 
@@ -6466,11 +6569,14 @@ static void main_click(App *a, uint32_t serial, double x, double y, int button)
 
     if (x < SIDEBAR_W) {
         a->sidebar_drive = -1;
+        a->sidebar_drive_dev[0] = '\0';
         if (y >= a->drives_y0 && y < a->drives_y0 + a->n_drives * 40) {
             int idx = (y - a->drives_y0) / 40;
             if (idx >= 0 && idx < a->n_drives) {
                 a->sidebar_drive = idx;
                 Drive *d = &a->drives[idx];
+                snprintf(a->sidebar_drive_dev, sizeof a->sidebar_drive_dev,
+                         "%s", d->dev);
                 if (d->mounted) navigate(a, d->mount, 1);
                 else { a->ctx_kind = CTX_DRIVE; a->ctx_index = idx;
                        drive_job(a, d, 0); }
@@ -6615,6 +6721,8 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
                     a->ctx_kind = CTX_DRIVE;
                     a->ctx_index = d;
                     a->sidebar_drive = d;
+                    snprintf(a->sidebar_drive_dev, sizeof a->sidebar_drive_dev,
+                             "%s", a->drives[d].dev);
                 }
             }
         } else if (a->pointer_y >= file_top_y(a) &&
@@ -9466,41 +9574,6 @@ static void state_save(App *a)
     fclose(f);
 }
 
-static void job_poll(App *a, Job *j)
-{
-    if (!j || j->pid <= 0 || j->fd < 0) return;
-
-    char buf[256];
-    for (int budget = 32; budget > 0; budget--) {
-        ssize_t n = read(j->fd, buf, sizeof buf);
-        if (n > 0) {
-            size_t room = sizeof j->buf - 1 - j->len;
-            if ((size_t)n > room) n = (ssize_t)room;
-            if (n > 0) {
-                memcpy(j->buf + j->len, buf, (size_t)n);
-                j->len += (size_t)n;
-                j->buf[j->len] = '\0';
-            }
-            continue;
-        }
-        if (n == 0) break;
-        if (errno == EINTR) continue;
-        break; /* EAGAIN, or an error: let waitpid decide */
-    }
-
-    int status = 0;
-    pid_t ret = waitpid(j->pid, &status, WNOHANG);
-    if (ret == 0) return;
-
-    int code = 1;
-    if (ret == j->pid) {
-        if (WIFEXITED(status)) code = WEXITSTATUS(status);
-    } else if (ret == (pid_t)-1 && errno == ECHILD) {
-        code = j->len ? 0 : 1;
-    }
-    job_finish(a, j, code);
-}
-
 static void menu_handle_done(App *a, Menu *m)
 {
     if (!m) return;
@@ -9531,10 +9604,29 @@ static int pump_events(App *a, int timeout_ms)
         want_write = 1;
     }
 
-    struct pollfd fds[32];
-    int job_idx[8];
+    /* Let GLib tell us which D-Bus descriptors to poll, using the same
+     * poll(2) call as the Wayland and helper-pipe fds below. */
+    GPollFD *dbus_fds = NULL;
+    gint n_dbus_fds = 0, dbus_timeout = -1, max_priority = 0;
+    gboolean dbus_ready = FALSE, dbus_acquired = FALSE;
+    if (a->dbus_ctx && (dbus_acquired = g_main_context_acquire(a->dbus_ctx))) {
+        dbus_ready = g_main_context_prepare(a->dbus_ctx, &max_priority);
+        n_dbus_fds = g_main_context_query(a->dbus_ctx, max_priority,
+                                          &dbus_timeout, NULL, 0);
+        dbus_fds = g_new0(GPollFD, n_dbus_fds > 0 ? (guint)n_dbus_fds : 1);
+        if (n_dbus_fds > 0)
+            g_main_context_query(a->dbus_ctx, max_priority, &dbus_timeout,
+                                 dbus_fds, n_dbus_fds);
+        if (dbus_ready || dbus_timeout == 0)
+            timeout_ms = 0;
+        else if (dbus_timeout > 0 &&
+                 (timeout_ms < 0 || dbus_timeout < timeout_ms))
+            timeout_ms = dbus_timeout;
+    }
+
+    struct pollfd fds[64];
     int write_idx[16];
-    int n_job_fds = 0, n_write_fds = 0;
+    int n_write_fds = 0;
     int nfds = 0;
 
     int wl_idx = nfds;
@@ -9543,8 +9635,8 @@ static int pump_events(App *a, int timeout_ms)
     fds[nfds].revents = 0;
     nfds++;
 
-    int ctl_idx = -1, client_idx = -1, xfer_idx = -1, thumb_idx = -1;
-    int ino_idx = -1, clip_idx = -1;
+    int ctl_idx = -1, client_idx = -1, thumb_idx = -1;
+    int ino_idx = -1, clip_idx = -1, dbus_first = -1;
     if (a->ctl_fd >= 0) {
         ctl_idx = nfds;
         fds[nfds].fd = a->ctl_fd;
@@ -9560,7 +9652,6 @@ static int pump_events(App *a, int timeout_ms)
         nfds++;
     }
     if (a->xfer.active && a->xfer.fd >= 0) {
-        xfer_idx = nfds;
         fds[nfds].fd = a->xfer.fd;
         fds[nfds].events = POLLIN;
         fds[nfds].revents = 0;
@@ -9588,14 +9679,16 @@ static int pump_events(App *a, int timeout_ms)
         nfds++;
     }
 
-    for (unsigned i = 0; i < sizeof a->jobs / sizeof a->jobs[0]; i++) {
-        Job *j = &a->jobs[i];
-        if (j->pid <= 0 || j->fd < 0) continue;
-        job_idx[n_job_fds++] = (int)i;
-        fds[nfds].fd = j->fd;
-        fds[nfds].events = POLLIN;
-        fds[nfds].revents = 0;
-        nfds++;
+    if (dbus_fds && n_dbus_fds > 0 &&
+        nfds + n_dbus_fds <= (int)G_N_ELEMENTS(fds)) {
+        dbus_first = nfds;
+        for (int i = 0; i < n_dbus_fds; i++) {
+            fds[nfds].fd = dbus_fds[i].fd;
+            fds[nfds].events = dbus_fds[i].events;
+            fds[nfds].revents = 0;
+            dbus_fds[i].revents = 0;
+            nfds++;
+        }
     }
 
     /* Keep pasting into other apps from blocking our Wayland event loop. */
@@ -9617,8 +9710,20 @@ static int pump_events(App *a, int timeout_ms)
         int ms = left <= 0.0 ? 0 : (int)(left * 1000.0);
         if (ms < timeout_ms || timeout_ms < 0) timeout_ms = ms;
     }
+
     int ret = poll(fds, (nfds_t)nfds, timeout_ms);
-    if (ret < 0) return errno == EINTR ? 0 : -1;
+    int poll_errno = errno;
+    if (dbus_acquired) {
+        for (int i = 0; i < n_dbus_fds; i++)
+            dbus_fds[i].revents = dbus_first >= 0 ?
+                                  (gushort)fds[dbus_first + i].revents : 0;
+        g_main_context_check(a->dbus_ctx, max_priority, dbus_fds, n_dbus_fds);
+        g_main_context_dispatch(a->dbus_ctx);
+        g_main_context_release(a->dbus_ctx);
+        g_free(dbus_fds);
+        jobs_dispatch(a);
+    }
+    if (ret < 0) return poll_errno == EINTR ? 0 : -1;
 
     if (fds[wl_idx].revents & POLLOUT) {
         if (wl_display_flush(a->display) < 0 && errno != EAGAIN &&
@@ -9634,15 +9739,6 @@ static int pump_events(App *a, int timeout_ms)
         ctl_accept(a);
     if (client_idx >= 0 && (fds[client_idx].revents & (POLLIN | POLLHUP | POLLERR)))
         ctl_read_client(a);
-
-    int first_job = 1 + (ctl_idx >= 0) + (client_idx >= 0) +
-                    (xfer_idx >= 0) + (thumb_idx >= 0) + (ino_idx >= 0) +
-                    (clip_idx >= 0);
-    for (int i = 0; i < n_job_fds; i++) {
-        if (!(fds[first_job + i].revents & (POLLIN | POLLHUP | POLLERR)))
-            continue;
-        job_poll(a, &a->jobs[job_idx[i]]);
-    }
 
     xfer_poll(a);
     xfer_window_maybe_open(a);
@@ -9697,12 +9793,26 @@ static void app_cleanup(App *a)
 
     for (unsigned i = 0; i < sizeof a->jobs / sizeof a->jobs[0]; i++) {
         Job *j = &a->jobs[i];
-        if (j->fd >= 0) { close(j->fd); j->fd = -1; }
-        if (j->pid > 0) {
-            int status;
-            waitpid(j->pid, &status, WNOHANG);
-            j->pid = 0;
+        if (j->active && j->cancel) g_cancellable_cancel(j->cancel);
+    }
+    if (a->dbus_ctx) {
+        /* Let cancellation callbacks run before we drop the proxies. */
+        for (int spin = 0; spin < 100; spin++) {
+            int active = 0;
+            for (unsigned i = 0; i < sizeof a->jobs / sizeof a->jobs[0]; i++)
+                active += a->jobs[i].active != 0;
+            if (!active) break;
+            g_main_context_iteration(a->dbus_ctx, FALSE);
         }
+    }
+    for (unsigned i = 0; i < sizeof a->jobs / sizeof a->jobs[0]; i++)
+        job_release(&a->jobs[i]);
+
+    if (a->udisks) { g_object_unref(a->udisks); a->udisks = NULL; }
+    if (a->dbus_ctx) {
+        g_main_context_pop_thread_default(a->dbus_ctx);
+        g_main_context_unref(a->dbus_ctx);
+        a->dbus_ctx = NULL;
     }
 
     thumb_stop_worker();
@@ -9899,6 +10009,7 @@ int main(int argc, char **argv)
     }
     ctl_start(&app);
     watch_init(&app);
+    udisks_init(&app);
 
     navigate(&app, start, 1);
     if (app.pending_select[0]) {
@@ -9925,6 +10036,10 @@ int main(int argc, char **argv)
         if (app.status[0] && mono_sec() - app.status_t >= 8.0) {
             app.status[0] = '\0';
             app.dirty = 1;
+        }
+        if (app.drives_dirty) {
+            app.drives_dirty = 0;
+            drive_refresh(&app);
         }
         if (mono_sec() >= next_drive_poll) {
             next_drive_poll = mono_sec() + 15.0;

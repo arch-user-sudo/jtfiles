@@ -1,5 +1,5 @@
 CC ?= cc
-PKGS = cairo pangocairo wayland-client xkbcommon
+PKGS = cairo pangocairo wayland-client xkbcommon udisks2
 PROTO_DIR := protocols
 SRC_DIR := src
 
