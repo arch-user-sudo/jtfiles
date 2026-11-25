@@ -91,6 +91,17 @@
 #define COLHEAD_H 30.0
 #define ROW_H 28.0
 
+/* Search field: half a blink period, plus hard bounds for the query-driven
+ * recursive walk so a huge tree cannot lock the UI thread. */
+#define CARET_HALF_S      0.5
+#define SEARCH_ROW_H      56.0          /* two normal list rows */
+#define SEARCH_MAX_RESULTS 4096
+#define SEARCH_MAX_VISITED 100000
+#define SEARCH_MAX_DEPTH  24
+#define SEARCH_KEEP_MAX   256
+#define SEARCH_SPIN_TICK_MS 33          /* ~30fps spinner, gentle on one core */
+#define SEARCH_SPIN_RPS    0.9          /* revolutions per second */
+
 /* Post-transfer selection lap: same timing and geometry as jtwpi. */
 #define SEL_LAP_MS       900.0
 #define SEL_LAP_TICK_MS  16
@@ -1518,6 +1529,13 @@ struct App {
     struct xkb_keymap *xkb_keymap;
     struct xkb_state *xkb_state;
 
+    /* jtlabwc only advertises repeat_info; it does not send synthetic repeated
+     * key events, so the client generates them from these deadlines. */
+    uint32_t repeat_key;
+    xkb_keysym_t repeat_sym;
+    int repeat_active, repeat_ctrl, repeat_alt, repeat_shift;
+    double repeat_at, repeat_delay, repeat_rate;
+
     char cwd[PATH_MAX];
     /* Set by --select FILE (or a file passed as PATH).  The folder is opened
      * normally and this entry is highlighted once its directory is loaded. */
@@ -1536,8 +1554,12 @@ struct App {
     double post_sel_anim_start;
     char *hist[64];
     int hist_n, hist_cap, hist_pos;
-    Entry *ents;
+    Entry *ents;              /* entries currently painted */
     int n_ents, cap_ents;
+    Entry *dir_ents;          /* full listing of a->cwd */
+    int n_dir, cap_dir;
+    Entry *search_ents;       /* current query's matches under a->cwd */
+    int n_search, cap_search;
     int sort_by, sort_desc, group_by, view, show_hidden;
     int scroll, sidebar_scroll, scroll_max;
     int smooth_scroll;          /* animated wheel scrolling, persisted */
@@ -1580,6 +1602,22 @@ struct App {
 
     char path_edit[PATH_MAX];
     int editing_path, path_cursor;
+
+    /* Top-right search box. dir_ents stays the current folder; search_ents
+     * holds only names matching the current query (or that folder when the
+     * query is empty); a->ents is the filtered list on screen. The caret uses
+     * absolute deadlines so blinking does not drift. */
+    char search[128];
+    int search_cursor;
+    int searching;             /* field has keyboard focus */
+    int search_active;         /* search result view is on screen */
+    int search_truncated;
+    unsigned search_gen;       /* only results for this generation are applied */
+    int search_pending;        /* worker scan in flight */
+    int saved_view;            /* view to restore when search closes */
+    int caret_on;
+    double caret_next;
+    double search_box_x, search_box_w; /* last drawn geometry, for hit-tests */
 
     char status[256];
     double status_t;
@@ -1641,9 +1679,17 @@ static atomic_uint g_thumb_gen;
 static int worker_submit_count(const char *path, time_t mtime);
 static void watch_update(App *a, const char *path);
 static void dir_load(App *a, const char *path);
+static void search_rebuild(App *a, int reset);
+static void search_cancel_pending(App *a);
+static void search_start(App *a);
+static void search_stop(App *a);
+static void search_sort(App *a);
+static void search_caret_reset(App *a);
+static void keyboard_cancel_repeat(App *a);
 static void scroll_index_into_view(App *a, int idx);
 static void post_xfer_disarm(App *a);
 static void apply_post_xfer_selection(App *a);
+static void apply_pending_select(App *a);
 static void clipboard_publish(App *a);
 static void clipboard_publish_text(App *a, const char *text);
 static int  clipboard_fetch(App *a, int *cut);
@@ -2076,14 +2122,19 @@ static void entry_type(Entry *e)
     }
 }
 
-static int entry_cmp(const void *va, const void *vb)
+/* Sorting is pure over these fields; the search worker uses a private copy
+ * so it never reads the App while the UI thread is editing it. */
+typedef struct {
+    int sort_by, sort_desc, group_by;
+} SortCtx;
+
+static int entry_cmp_fields(const void *va, const void *vb, const SortCtx *c)
 {
     const Entry *a = va, *b = vb;
-    App *app = g_app_signal;
-    int desc = app ? app->sort_desc : 0;
+    int desc = c->sort_desc;
     int r = 0;
     if (a->is_dir != b->is_dir) return a->is_dir ? -1 : 1;
-    if (app && app->group_by == GROUP_TYPE && !a->is_dir && !b->is_dir) {
+    if (c->group_by == GROUP_TYPE && !a->is_dir && !b->is_dir) {
         const char *ia = strstr(a->icon, "image") ? "image" :
                           strstr(a->icon, "video") ? "video" :
                           strstr(a->icon, "audio") ? "audio" : "file";
@@ -2093,11 +2144,11 @@ static int entry_cmp(const void *va, const void *vb)
         int g = strcmp(ia, ib);
         if (g) return g;
     }
-    if (app && app->group_by == GROUP_DATE) {
+    if (c->group_by == GROUP_DATE) {
         int da = (int)(a->mtime / 86400), db = (int)(b->mtime / 86400);
         if (da != db) return desc ? db - da : da - db;
     }
-    switch (app ? app->sort_by : SORT_NAME) {
+    switch (c->sort_by) {
     case SORT_DATE: r = (a->mtime > b->mtime) - (a->mtime < b->mtime); break;
     case SORT_TYPE:
         r = strcmp(a->type, b->type);
@@ -2107,6 +2158,15 @@ static int entry_cmp(const void *va, const void *vb)
     default:        r = strcasecmp(a->name, b->name); break;
     }
     return desc ? -r : r;
+}
+
+static int entry_cmp(const void *va, const void *vb)
+{
+    App *app = g_app_signal;
+    SortCtx c = { app ? app->sort_by : SORT_NAME,
+                  app ? app->sort_desc : 0,
+                  app ? app->group_by : GROUP_NONE };
+    return entry_cmp_fields(va, vb, &c);
 }
 
 static void status_set(App *a, const char *fmt, ...)
@@ -2298,17 +2358,27 @@ static void dir_load(App *a, const char *path)
             else e->count_state = 0;
         }
     }
-    free(a->ents);
-    a->ents = ents;
-    a->cap_ents = cap;
-    qsort(a->ents, (size_t)a->n_ents, sizeof *a->ents, entry_cmp);
-    free(a->selected);
-    a->selected = calloc((size_t)(a->n_ents > 0 ? a->n_ents : 1), 1);
-    a->n_selected = 0;
-    a->sel = a->anchor = -1;
-    a->scroll = 0;
-    scroll_snap(a);
-    a->drag_select = 0;
+    qsort(ents, (size_t)a->n_ents, sizeof *ents, entry_cmp);
+    free(a->dir_ents);
+    a->dir_ents = ents;
+    a->n_dir = a->n_ents;
+    a->cap_dir = cap;
+
+    /* Navigation always leaves search mode. Restore the saved view only when
+     * leaving search; ordinary navigation must keep the view the user chose. */
+    int was_search = a->search_active || a->searching;
+    search_cancel_pending(a);
+    free(a->search_ents);
+    a->search_ents = NULL;
+    a->n_search = a->cap_search = 0;
+    a->searching = 0;
+    a->search_active = 0;
+    a->search[0] = '\0';
+    a->search_cursor = 0;
+    a->search_truncated = 0;
+    if (was_search) a->view = a->saved_view;
+
+    search_rebuild(a, 1);
     apply_post_xfer_selection(a);
     a->dirty = 1;
 }
@@ -2350,6 +2420,608 @@ static void go_hist(App *a, int dir)
     a->hist_pos = p;
     dir_load(a, a->hist[p]);
     snprintf(a->path_edit, sizeof a->path_edit, "%s", a->cwd);
+}
+
+/* ---- recursive search ------------------------------------------------ *
+ * The recursive walk runs on its own thread. Each query gets a generation;
+ * superseding it (typing, cancelling, navigating, quitting) flips an atomic
+ * flag so the worker stops mid-scan, closes its open directories and drops
+ * partial results. Only a completed result for the current generation is
+ * installed into a->ents on the UI thread. An empty query just lists cwd.
+ * ----------------------------------------------------------------------- */
+
+static void search_caret_reset(App *a)
+{
+    a->caret_on = 1;
+    a->caret_next = mono_sec() + CARET_HALF_S;
+}
+
+static void search_caret_tick(App *a)
+{
+    if (!a->searching) return;
+    double now = mono_sec();
+    if (now < a->caret_next) return;
+    int flips = 0;
+    while (now >= a->caret_next && flips < 8) {
+        a->caret_on = !a->caret_on;
+        a->caret_next += CARET_HALF_S;
+        flips++;
+    }
+    if (flips == 8) a->caret_next = now + CARET_HALF_S;
+    a->dirty = 1;
+}
+
+typedef struct SearchReq {
+    struct SearchReq *next;
+    unsigned gen;
+    char cwd[PATH_MAX];
+    char query[128];
+    int show_hidden;
+    SortCtx sort;
+} SearchReq;
+
+typedef struct SearchRes {
+    struct SearchRes *next;
+    unsigned gen;
+    Entry *ents;
+    int n, cap;
+    int truncated;
+} SearchRes;
+
+typedef struct {
+    unsigned gen;
+    char cwd[PATH_MAX];
+    char query[128];
+    int show_hidden;
+    Entry *ents;
+    int n, cap;
+    int truncated;
+    int sorted;
+} SearchScan;
+
+static pthread_mutex_t search_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t search_cv = PTHREAD_COND_INITIALIZER;
+static SearchReq *search_req_head, *search_req_tail;
+static SearchRes *search_res_head, *search_res_tail;
+static pthread_t search_tid;
+static int search_thread_started, search_wake[2] = { -1, -1 };
+static atomic_uint search_gen_counter = 0;
+static atomic_uint search_live_gen = 0;
+static atomic_uint search_done_gen = 0;
+static atomic_int search_shutdown = 0;
+static _Thread_local SortCtx search_sort_ctx;
+
+/* The worker only touches its own scan, never the App, so cancellation can
+ * be checked without taking a lock on every directory entry. */
+static int sr_cancelled(const SearchScan *s)
+{
+    return atomic_load(&search_shutdown) ||
+           atomic_load(&search_live_gen) != s->gen;
+}
+
+static Entry *sr_push(SearchScan *s)
+{
+    if (s->n >= SEARCH_MAX_RESULTS) {
+        s->truncated = 1;
+        return NULL;
+    }
+    if (s->n >= s->cap) {
+        int cap = s->cap > 0 ? s->cap * 2 : 256;
+        Entry *n = realloc(s->ents, (size_t)cap * sizeof *n);
+        if (!n) {
+            s->truncated = 1;
+            return NULL;
+        }
+        s->ents = n;
+        s->cap = cap;
+    }
+    Entry *e = &s->ents[s->n++];
+    memset(e, 0, sizeof *e);
+    return e;
+}
+
+static void sr_free(SearchScan *s)
+{
+    free(s->ents);
+    s->ents = NULL;
+    s->n = s->cap = 0;
+}
+
+static int sr_name_match(const char *name, const char *q)
+{
+    if (!q || !*q) return 1;
+    const unsigned char *needle = (const unsigned char *)q;
+    const unsigned char *hay = (const unsigned char *)name;
+    for (; *hay; hay++) {
+        const unsigned char *p = needle, *h = hay;
+        while (*p && *h && tolower(*p) == tolower(*h)) { p++; h++; }
+        if (!*p) return 1;
+    }
+    return 0;
+}
+
+static int search_match(const Entry *e, const char *q)
+{
+    return sr_name_match(e->name, q);
+}
+
+/* Kernel pseudo-filesystems under / are huge and never hold user files. */
+static int sr_skip_root_dir(const char *dir, const char *name)
+{
+    if (strcmp(dir, "/")) return 0;
+    return !strcmp(name, "proc") || !strcmp(name, "sys") ||
+           !strcmp(name, "dev") || !strcmp(name, "run");
+}
+
+/* Checked before every recurse and every entry so a superseded scan stops
+ * quickly and every opened DIR is still closed. */
+static void sr_walk(SearchScan *s, const char *dir, int depth, int *visited)
+{
+    if (sr_cancelled(s) || s->truncated || depth > SEARCH_MAX_DEPTH) return;
+    if (++(*visited) > SEARCH_MAX_VISITED) {
+        s->truncated = 1;
+        return;
+    }
+    DIR *d = opendir(dir);
+    if (!d) return;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (sr_cancelled(s) || s->truncated) break;
+        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
+        if (!s->show_hidden && de->d_name[0] == '.') continue;
+        if (sr_skip_root_dir(dir, de->d_name)) continue;
+        char path[PATH_MAX];
+        path_join(path, sizeof path, dir, de->d_name);
+        struct stat st;
+        if (lstat(path, &st) != 0) continue;
+        int is_link = S_ISLNK(st.st_mode);
+        int is_dir = S_ISDIR(st.st_mode);
+        if (is_link) {
+            struct stat ts;
+            if (stat(path, &ts) == 0 && S_ISDIR(ts.st_mode)) is_dir = 1;
+        }
+        int descend = is_dir && !is_link;
+        if (!sr_name_match(de->d_name, s->query)) {
+            if (descend) sr_walk(s, path, depth + 1, visited);
+            continue;
+        }
+        Entry *e = sr_push(s);
+        if (!e) break;
+        snprintf(e->name, sizeof e->name, "%s", de->d_name);
+        snprintf(e->path, sizeof e->path, "%s", path);
+        e->mode = st.st_mode;
+        e->size = st.st_size;
+        e->mtime = st.st_mtime;
+        e->is_dir = is_dir;
+        e->is_link = is_link;
+        entry_icon(e);
+        entry_type(e);
+        if (descend) sr_walk(s, path, depth + 1, visited);
+    }
+    closedir(d);
+}
+
+static int search_entry_cmp(const void *va, const void *vb)
+{
+    return entry_cmp_fields(va, vb, &search_sort_ctx);
+}
+
+static void search_wake_drain(void)
+{
+    unsigned char buf[128];
+    while (search_wake[0] >= 0 && read(search_wake[0], buf, sizeof buf) > 0) {}
+}
+
+/* Move a finished scan into the App. Only ever called on the UI thread. */
+static void search_install(App *a, SearchScan *s)
+{
+    int n = s->n;
+    free(a->search_ents);
+    a->search_ents = s->ents;
+    a->n_search = s->n;
+    a->cap_search = s->cap;
+    a->search_truncated = s->truncated;
+    a->search_pending = 0;
+    s->ents = NULL;
+    s->n = s->cap = 0;
+    if (!s->sorted && n > 1)
+        qsort(a->search_ents, (size_t)n, sizeof *a->search_ents, entry_cmp);
+    search_rebuild(a, 0);
+    a->dirty = 1;
+}
+
+/* Supersede any in-flight scan. The worker sees the new generation on its
+ * next check and unwinds without waiting for us. */
+static void search_cancel_pending(App *a)
+{
+    a->search_gen = atomic_fetch_add(&search_gen_counter, 1) + 1;
+    atomic_store(&search_live_gen, a->search_gen);
+    a->search_pending = 0;
+
+    pthread_mutex_lock(&search_mu);
+    SearchReq *r = search_req_head;
+    search_req_head = search_req_tail = NULL;
+    pthread_mutex_unlock(&search_mu);
+    while (r) {
+        SearchReq *next = r->next;
+        free(r);
+        r = next;
+    }
+}
+
+static void search_collect(App *a)
+{
+    search_wake_drain();
+    for (;;) {
+        pthread_mutex_lock(&search_mu);
+        SearchRes *res = search_res_head;
+        if (res) {
+            search_res_head = res->next;
+            if (!search_res_head) search_res_tail = NULL;
+        }
+        pthread_mutex_unlock(&search_mu);
+        if (!res) break;
+
+        if (res->gen == a->search_gen && a->search_active) {
+            SearchScan s;
+            memset(&s, 0, sizeof s);
+            s.gen = res->gen;
+            s.ents = res->ents;
+            s.n = res->n;
+            s.cap = res->cap;
+            s.truncated = res->truncated;
+            s.sorted = 1;
+            res->ents = NULL;
+            search_install(a, &s);
+        }
+        free(res->ents);
+        free(res);
+    }
+
+    /* A worker that aborted or hit an allocation failure still wakes us. */
+    if (a->search_pending && atomic_load(&search_done_gen) == a->search_gen) {
+        free(a->search_ents);
+        a->search_ents = NULL;
+        a->n_search = a->cap_search = 0;
+        a->search_truncated = 0;
+        a->search_pending = 0;
+        search_rebuild(a, 0);
+        a->dirty = 1;
+    }
+}
+
+static void *search_thread_main(void *unused)
+{
+    (void)unused;
+    for (;;) {
+        pthread_mutex_lock(&search_mu);
+        while (!search_req_head && !atomic_load(&search_shutdown))
+            pthread_cond_wait(&search_cv, &search_mu);
+        SearchReq *r = search_req_head;
+        if (!r) {
+            pthread_mutex_unlock(&search_mu);
+            break;
+        }
+        search_req_head = r->next;
+        if (!search_req_head) search_req_tail = NULL;
+        pthread_mutex_unlock(&search_mu);
+
+        SearchScan s;
+        memset(&s, 0, sizeof s);
+        s.gen = r->gen;
+        snprintf(s.cwd, sizeof s.cwd, "%s", r->cwd);
+        snprintf(s.query, sizeof s.query, "%s", r->query);
+        s.show_hidden = r->show_hidden;
+        search_sort_ctx = r->sort;
+        free(r);
+
+        if (!sr_cancelled(&s)) {
+            int visited = 0;
+            sr_walk(&s, s.cwd, 0, &visited);
+        }
+        if (!sr_cancelled(&s)) {
+            if (s.n > 1) {
+                qsort(s.ents, (size_t)s.n, sizeof *s.ents, search_entry_cmp);
+                s.sorted = 1;
+            }
+            SearchRes *res = calloc(1, sizeof *res);
+            if (res) {
+                res->gen = s.gen;
+                res->ents = s.ents;
+                res->n = s.n;
+                res->cap = s.cap;
+                res->truncated = s.truncated;
+                pthread_mutex_lock(&search_mu);
+                res->next = NULL;
+                if (search_res_tail) search_res_tail->next = res;
+                else search_res_head = res;
+                search_res_tail = res;
+                pthread_mutex_unlock(&search_mu);
+                s.ents = NULL;
+                s.n = s.cap = 0;
+            }
+        }
+        atomic_store(&search_done_gen, s.gen);
+        unsigned char byte = 1;
+        if (search_wake[1] >= 0) (void)!write(search_wake[1], &byte, 1);
+        sr_free(&s);
+    }
+    return NULL;
+}
+
+static void search_thread_start(void)
+{
+    atomic_store(&search_shutdown, 0);
+    if (pipe2(search_wake, O_CLOEXEC | O_NONBLOCK) != 0) {
+        search_wake[0] = search_wake[1] = -1;
+        return;
+    }
+    if (pthread_create(&search_tid, NULL, search_thread_main, NULL) == 0) {
+        search_thread_started = 1;
+        return;
+    }
+    close(search_wake[0]);
+    close(search_wake[1]);
+    search_wake[0] = search_wake[1] = -1;
+}
+
+static void search_thread_stop(void)
+{
+    if (!search_thread_started) return;
+    atomic_store(&search_shutdown, 1);
+    pthread_cond_broadcast(&search_cv);
+    pthread_join(search_tid, NULL);
+    search_thread_started = 0;
+
+    pthread_mutex_lock(&search_mu);
+    while (search_req_head) {
+        SearchReq *r = search_req_head;
+        search_req_head = r->next;
+        free(r);
+    }
+    search_req_tail = NULL;
+    while (search_res_head) {
+        SearchRes *r = search_res_head;
+        search_res_head = r->next;
+        free(r->ents);
+        free(r);
+    }
+    search_res_tail = NULL;
+    pthread_mutex_unlock(&search_mu);
+
+    if (search_wake[0] >= 0) close(search_wake[0]);
+    if (search_wake[1] >= 0) close(search_wake[1]);
+    search_wake[0] = search_wake[1] = -1;
+}
+
+/* With an empty query there is nothing to hunt for, so stay in the current
+ * folder instead of walking the whole tree just to match everything. */
+static void search_build(App *a, const char *q)
+{
+    search_cancel_pending(a);
+    free(a->search_ents);
+    a->search_ents = NULL;
+    a->n_search = a->cap_search = 0;
+    a->search_truncated = 0;
+
+    if (!q || !*q) {
+        SearchScan s;
+        memset(&s, 0, sizeof s);
+        s.gen = a->search_gen;
+        for (int i = 0; i < a->n_dir; i++) {
+            Entry *e = sr_push(&s);
+            if (!e) break;
+            *e = a->dir_ents[i];
+        }
+        search_install(a, &s);
+        return;
+    }
+
+    a->search_pending = 1;
+
+    if (!search_thread_started) {
+        SearchScan s;
+        memset(&s, 0, sizeof s);
+        s.gen = a->search_gen;
+        snprintf(s.cwd, sizeof s.cwd, "%s", a->cwd);
+        snprintf(s.query, sizeof s.query, "%s", q);
+        s.show_hidden = a->show_hidden;
+        int visited = 0;
+        sr_walk(&s, s.cwd, 0, &visited);
+        search_install(a, &s);
+        return;
+    }
+
+    SearchReq *r = calloc(1, sizeof *r);
+    if (!r) {
+        a->search_pending = 0;
+        search_rebuild(a, 0);
+        return;
+    }
+    r->gen = a->search_gen;
+    snprintf(r->cwd, sizeof r->cwd, "%s", a->cwd);
+    snprintf(r->query, sizeof r->query, "%s", q);
+    r->show_hidden = a->show_hidden;
+    r->sort.sort_by = a->sort_by;
+    r->sort.sort_desc = a->sort_desc;
+    r->sort.group_by = a->group_by;
+
+    pthread_mutex_lock(&search_mu);
+    r->next = NULL;
+    if (search_req_tail) search_req_tail->next = r;
+    else search_req_head = r;
+    search_req_tail = r;
+    pthread_cond_signal(&search_cv);
+    pthread_mutex_unlock(&search_mu);
+
+    search_rebuild(a, 0);
+    a->dirty = 1;
+}
+
+/* Directory shown under each result, relative to the folder being searched. */
+static void search_rel_dir(const App *a, const Entry *e,
+                           char *out, size_t n)
+{
+    const char *p = e->path;
+    size_t cwd_len = strlen(a->cwd);
+    if (!strncmp(p, a->cwd, cwd_len) && p[cwd_len] == '/')
+        p += cwd_len + 1;
+    const char *slash = strrchr(p, '/');
+    if (slash && slash > p)
+        snprintf(out, n, "%.*s", (int)(slash - p), p);
+    else
+        snprintf(out, n, ".");
+}
+
+static void search_keep_add(char **keep, int *n, const char *path)
+{
+    if (!path || !*path || *n >= SEARCH_KEEP_MAX) return;
+    for (int i = 0; i < *n; i++)
+        if (keep[i] && !strcmp(keep[i], path)) return;
+    keep[*n] = strdup(path);
+    if (keep[*n]) (*n)++;
+}
+
+static void search_rebuild(App *a, int reset)
+{
+    Entry *src = a->search_active ? a->search_ents : a->dir_ents;
+    int nsrc = a->search_active ? a->n_search : a->n_dir;
+    if (a->search_active) a->view = VIEW_LIST;
+
+    /* Selection is tracked by path: filtering must not leave stale indices. */
+    char **keep = calloc(SEARCH_KEEP_MAX, sizeof *keep);
+    int nkeep = 0;
+    char sel_path[PATH_MAX] = { 0 }, anchor_path[PATH_MAX] = { 0 };
+    char ctx_path[PATH_MAX] = { 0 };
+    if (!reset && keep) {
+        if (a->sel >= 0 && a->sel < a->n_ents)
+            snprintf(sel_path, sizeof sel_path, "%s", a->ents[a->sel].path);
+        if (a->anchor >= 0 && a->anchor < a->n_ents)
+            snprintf(anchor_path, sizeof anchor_path, "%s",
+                     a->ents[a->anchor].path);
+        if (a->ctx_kind == CTX_FILE && a->ctx_index >= 0 &&
+            a->ctx_index < a->n_ents)
+            snprintf(ctx_path, sizeof ctx_path, "%s",
+                     a->ents[a->ctx_index].path);
+        search_keep_add(keep, &nkeep, sel_path);
+        if (a->selected)
+            for (int i = 0; i < a->n_ents && nkeep < SEARCH_KEEP_MAX; i++)
+                if (a->selected[i])
+                    search_keep_add(keep, &nkeep, a->ents[i].path);
+    }
+
+    if (a->cap_ents < nsrc) {
+        int cap = a->cap_ents > 0 ? a->cap_ents : 256;
+        while (cap < nsrc) cap *= 2;
+        Entry *n = realloc(a->ents, (size_t)cap * sizeof *n);
+        if (!n) {
+            for (int i = 0; i < nkeep; i++) free(keep[i]);
+            free(keep);
+            return;
+        }
+        a->ents = n;
+        a->cap_ents = cap;
+    }
+
+    a->n_ents = 0;
+    for (int i = 0; i < nsrc; i++) {
+        Entry *s = &src[i];
+        if (!search_match(s, a->search)) continue;
+        a->ents[a->n_ents++] = *s;
+    }
+
+    free(a->selected);
+    a->selected = calloc((size_t)(a->n_ents > 0 ? a->n_ents : 1), 1);
+    a->n_selected = 0;
+    int sel = -1, anchor = -1, ctx = -1;
+    for (int i = 0; i < a->n_ents; i++) {
+        const char *path = a->ents[i].path;
+        for (int k = 0; k < nkeep; k++) {
+            if (!keep[k] || strcmp(path, keep[k])) continue;
+            a->selected[i] = 1;
+            a->n_selected++;
+            break;
+        }
+        if (sel_path[0] && !strcmp(path, sel_path)) sel = i;
+        if (!anchor_path[0]) {
+            if (sel >= 0) anchor = sel;
+        } else if (!strcmp(path, anchor_path)) anchor = i;
+        if (ctx_path[0] && !strcmp(path, ctx_path)) ctx = i;
+    }
+    a->sel = sel;
+    a->anchor = anchor >= 0 ? anchor : sel;
+    if (a->ctx_kind == CTX_FILE) a->ctx_index = ctx;
+
+    a->scroll = 0;
+    scroll_snap(a);
+    a->drag_select = 0;
+    a->sb_drag = 0;
+    a->dirty = 1;
+
+    for (int i = 0; i < nkeep; i++) free(keep[i]);
+    free(keep);
+}
+
+static void search_start(App *a)
+{
+    if (!a->search_active) {
+        a->saved_view = a->view;
+        a->search_active = 1;
+    }
+    a->editing_path = 0;
+    a->searching = 1;
+    a->search[0] = '\0';
+    a->search_cursor = 0;
+    search_build(a, a->search);
+    search_caret_reset(a);
+}
+
+static void search_stop(App *a)
+{
+    if (!a->search_active && !a->searching) return;
+    search_cancel_pending(a);
+    a->searching = 0;
+    a->search_active = 0;
+    a->search[0] = '\0';
+    a->search_cursor = 0;
+    a->search_truncated = 0;
+    a->view = a->saved_view;
+    free(a->search_ents);
+    a->search_ents = NULL;
+    a->n_search = a->cap_search = 0;
+    search_rebuild(a, 0);
+}
+
+static void search_sort(App *a)
+{
+    /* Resubmit so the worker's sort snapshot matches the new setting. */
+    if (a->search_active) {
+        search_build(a, a->search);
+        return;
+    }
+    if (a->n_dir > 1)
+        qsort(a->dir_ents, (size_t)a->n_dir, sizeof *a->dir_ents, entry_cmp);
+    search_rebuild(a, 0);
+}
+
+/* Enter/double-click on a result: open its containing folder and highlight
+ * the result there, even when the result itself is a folder. */
+static void search_accept_path(App *a, const char *path)
+{
+    if (!a->search_active || !path || !*path) return;
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash && slash != dir) *slash = '\0';
+    else snprintf(dir, sizeof dir, "/");
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    snprintf(a->pending_select, sizeof a->pending_select, "%s", base);
+    a->pending_select_stage = 0;
+    navigate(a, dir, 1);
+    apply_pending_select(a);
+    a->pending_select[0] = '\0';
+    a->dirty = 1;
 }
 
 /* ---- drives: libudisks2 for enumeration and mount operations ---------
@@ -4178,6 +4850,12 @@ static void action_activate(App *a, int id)
         if (d) {
             if (d->mounted) navigate(a, d->mount, 1);
             else drive_job(a, d, 0);
+        } else if (a->search_active) {
+            /* Results are paths anywhere under cwd: reveal them in their own
+             * folder instead of opening a file or descending into a folder. */
+            if (e) search_accept_path(a, e->path);
+            else if (a->sel >= 0 && a->sel < a->n_ents)
+                search_accept_path(a, a->ents[a->sel].path);
         } else if (e) {
             if (e->is_dir) navigate(a, e->path, 1);
             else open_path(e->path);
@@ -4260,28 +4938,29 @@ static void action_activate(App *a, int id)
             dialog_window_open(a);
         }
         break;
-    case A_VIEW_LIST: a->view = VIEW_LIST; scroll_snap(a); a->dirty = 1; break;
-    case A_VIEW_ICONS: a->view = VIEW_ICONS; scroll_snap(a); a->dirty = 1; break;
-    case A_VIEW_DETAILS: a->view = VIEW_DETAILS; scroll_snap(a); a->dirty = 1; break;
-    case A_VIEW_TILES: a->view = VIEW_TILES; scroll_snap(a); a->dirty = 1; break;
-    case A_SORT_NAME: a->sort_by = SORT_NAME;
-        qsort(a->ents, (size_t)a->n_ents, sizeof *a->ents, entry_cmp); a->dirty = 1; break;
-    case A_SORT_DATE: a->sort_by = SORT_DATE;
-        qsort(a->ents, (size_t)a->n_ents, sizeof *a->ents, entry_cmp); a->dirty = 1; break;
-    case A_SORT_TYPE: a->sort_by = SORT_TYPE;
-        qsort(a->ents, (size_t)a->n_ents, sizeof *a->ents, entry_cmp); a->dirty = 1; break;
-    case A_SORT_SIZE: a->sort_by = SORT_SIZE;
-        qsort(a->ents, (size_t)a->n_ents, sizeof *a->ents, entry_cmp); a->dirty = 1; break;
-    case A_SORT_ASC: a->sort_desc = 0;
-        qsort(a->ents, (size_t)a->n_ents, sizeof *a->ents, entry_cmp); a->dirty = 1; break;
-    case A_SORT_DESC: a->sort_desc = 1;
-        qsort(a->ents, (size_t)a->n_ents, sizeof *a->ents, entry_cmp); a->dirty = 1; break;
-    case A_GROUP_NONE: a->group_by = GROUP_NONE;
-        qsort(a->ents, (size_t)a->n_ents, sizeof *a->ents, entry_cmp); a->dirty = 1; break;
-    case A_GROUP_TYPE: a->group_by = GROUP_TYPE;
-        qsort(a->ents, (size_t)a->n_ents, sizeof *a->ents, entry_cmp); a->dirty = 1; break;
-    case A_GROUP_DATE: a->group_by = GROUP_DATE;
-        qsort(a->ents, (size_t)a->n_ents, sizeof *a->ents, entry_cmp); a->dirty = 1; break;
+    /* Results stay in list mode so the containing directory has a line under
+     * each name; the choice is remembered for when search closes. */
+    case A_VIEW_LIST:
+        if (a->search_active) { a->saved_view = VIEW_LIST; break; }
+        a->view = VIEW_LIST; scroll_snap(a); a->dirty = 1; break;
+    case A_VIEW_ICONS:
+        if (a->search_active) { a->saved_view = VIEW_ICONS; break; }
+        a->view = VIEW_ICONS; scroll_snap(a); a->dirty = 1; break;
+    case A_VIEW_DETAILS:
+        if (a->search_active) { a->saved_view = VIEW_DETAILS; break; }
+        a->view = VIEW_DETAILS; scroll_snap(a); a->dirty = 1; break;
+    case A_VIEW_TILES:
+        if (a->search_active) { a->saved_view = VIEW_TILES; break; }
+        a->view = VIEW_TILES; scroll_snap(a); a->dirty = 1; break;
+    case A_SORT_NAME: a->sort_by = SORT_NAME; search_sort(a); break;
+    case A_SORT_DATE: a->sort_by = SORT_DATE; search_sort(a); break;
+    case A_SORT_TYPE: a->sort_by = SORT_TYPE; search_sort(a); break;
+    case A_SORT_SIZE: a->sort_by = SORT_SIZE; search_sort(a); break;
+    case A_SORT_ASC: a->sort_desc = 0; search_sort(a); break;
+    case A_SORT_DESC: a->sort_desc = 1; search_sort(a); break;
+    case A_GROUP_NONE: a->group_by = GROUP_NONE; search_sort(a); break;
+    case A_GROUP_TYPE: a->group_by = GROUP_TYPE; search_sort(a); break;
+    case A_GROUP_DATE: a->group_by = GROUP_DATE; search_sort(a); break;
     case A_NEW_FOLDER: case A_NEW_TEXT: case A_NEW_ZIP: do_new_item(a, id); break;
     case A_NEW_SHORTCUT: {
         char p[PATH_MAX];
@@ -4842,6 +5521,8 @@ static int thumb_collect(App *a)
             fake.size = r->count;
             fake.count_state = (unsigned char)r->state;
             count_cache_store(a, &fake);
+            Entry *src = a->search_active ? a->search_ents : a->dir_ents;
+            int nsrc = a->search_active ? a->n_search : a->n_dir;
             for (int i = 0; i < a->n_ents; i++) {
                 Entry *e = &a->ents[i];
                 if (e->count_state != 3 || e->mtime != r->mtime ||
@@ -4851,6 +5532,14 @@ static int thumb_collect(App *a)
                 e->count_state = (unsigned char)r->state;
                 applied = 1;
                 counts_changed = 1;
+            }
+            /* Keep the snapshot in step so the next search rebuild does not
+             * throw the count away and queue the same worker job again. */
+            for (int i = 0; i < nsrc; i++) {
+                Entry *e = &src[i];
+                if (e->mtime != r->mtime || strcmp(e->path, r->path)) continue;
+                e->size = r->count;
+                e->count_state = (unsigned char)r->state;
             }
         } else if (r->gen == gen) {
             for (int i = 0; i < THUMB_CACHE_MAX; i++) {
@@ -4875,6 +5564,9 @@ static int thumb_collect(App *a)
         char sel_path[PATH_MAX] = { 0 };
         if (a->sel >= 0 && a->sel < a->n_ents)
             snprintf(sel_path, sizeof sel_path, "%s", a->ents[a->sel].path);
+        Entry *src = a->search_active ? a->search_ents : a->dir_ents;
+        int nsrc = a->search_active ? a->n_search : a->n_dir;
+        if (nsrc > 1) qsort(src, (size_t)nsrc, sizeof *src, entry_cmp);
         qsort(a->ents, (size_t)a->n_ents, sizeof *a->ents, entry_cmp);
         if (sel_path[0])
             for (int i = 0; i < a->n_ents; i++)
@@ -5060,22 +5752,97 @@ static void draw_toolbar(App *a, cairo_t *cr)
         cairo_stroke(cr);
     }
 
-    double sx = a->WIN_W - 156.0;
+    double vx = a->WIN_W - 156.0;       /* fixed anchor for view buttons */
     int list_on = a->view == VIEW_LIST || a->view == VIEW_DETAILS;
-    double tx = sx - 76.0, gx = sx - 40.0;
-    rounded_rect(cr, tx, 12, 30, 30, 7);
-    rgba(cr, C_ACCENT, list_on ? 0.20 : 0.05);
-    cairo_fill(cr);
-    icon_draw(a, cr, "view-list", 16.0, tx + 7.0, 19.0);
-    rounded_rect(cr, gx, 12, 30, 30, 7);
-    rgba(cr, C_ACCENT, !list_on ? 0.20 : 0.05);
-    cairo_fill(cr);
-    icon_draw(a, cr, "view-grid", 16.0, gx + 7.0, 19.0);
+    double tx = vx - 76.0, gx = vx - 40.0;
+    if (a->search_active || a->searching) {
+        /* The old list-button slot becomes a spinner while the worker scans. */
+        if (a->search_pending) {
+            rounded_rect(cr, tx, 12, 30, 30, 7);
+            rgba(cr, C_ACCENT, 0.07);
+            cairo_fill(cr);
 
-    ui_card_fill(cr, sx, 12, 144.0, 31, 8);
-    icon_draw(a, cr, "system-search-symbolic", 14.0, sx + 9.0, 20.5);
-    text_draw(cr, "Search", 12, 400, C_FAINT, 0.9,
-              sx + 30.0, 22.0, ALIGN_LEFT, 0.0);
+            double cx = tx + 15.0, cy = 27.0, r = 7.5;
+            double phase = fmod(mono_sec() * SEARCH_SPIN_RPS, 1.0) * 2.0 * M_PI;
+            cairo_save(cr);
+            cairo_set_line_width(cr, 2.0);
+            cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+            rgba(cr, C_ACCENT, 0.14);
+            cairo_arc(cr, cx, cy, r, 0.0, 2.0 * M_PI);
+            cairo_stroke(cr);
+            rgba(cr, C_ACCENT, 0.95);
+            cairo_arc(cr, cx, cy, r, phase, phase + 1.7);
+            cairo_stroke(cr);
+            rgba(cr, C_ACCENT, 0.35);
+            cairo_arc(cr, cx, cy, r, phase + 2.2, phase + 2.9);
+            cairo_stroke(cr);
+            cairo_restore(cr);
+        }
+        /* The remaining slot is the X cancel button. */
+        rounded_rect(cr, gx, 12, 30, 30, 7);
+        rgba(cr, C_ACCENT, a->hover_btn == 5 ? 0.22 : 0.08);
+        cairo_fill(cr);
+        rgba(cr, C_FG, 0.88);
+        cairo_set_line_width(cr, 1.4);
+        cairo_move_to(cr, gx + 11.0, 23.0);
+        cairo_line_to(cr, gx + 19.0, 31.0);
+        cairo_move_to(cr, gx + 19.0, 23.0);
+        cairo_line_to(cr, gx + 11.0, 31.0);
+        cairo_stroke(cr);
+    } else {
+        rounded_rect(cr, tx, 12, 30, 30, 7);
+        rgba(cr, C_ACCENT, list_on ? 0.20 : 0.05);
+        cairo_fill(cr);
+        icon_draw(a, cr, "view-list", 16.0, tx + 7.0, 19.0);
+        rounded_rect(cr, gx, 12, 30, 30, 7);
+        rgba(cr, C_ACCENT, !list_on ? 0.20 : 0.05);
+        cairo_fill(cr);
+        icon_draw(a, cr, "view-grid", 16.0, gx + 7.0, 19.0);
+    }
+
+    /* The box keeps its fixed width; only the search indicator is dropped
+     * while typing, giving the text a little more room. */
+    int search_text = a->searching || a->search[0];
+    double bw = 144.0;
+    double bx = vx;
+    double text_x = search_text ? bx + 10.0 : bx + 30.0;
+    double text_w = search_text ? bw - 20.0 : bw - 40.0;
+    a->search_box_x = bx;
+    a->search_box_w = bw;
+
+    ui_card_fill(cr, bx, 12, bw, 31, 8);
+    if (a->searching) {
+        rgba(cr, C_ACCENT, 0.55);
+        cairo_set_line_width(cr, 1.0);
+        rounded_rect(cr, bx + 0.5, 12.5, bw - 1.0, 30.0, 7.5);
+        cairo_stroke(cr);
+    }
+    if (search_text) {
+        char query[128];
+        snprintf(query, sizeof query, "%s", a->search);
+        ui_ellipsize(cr, query, sizeof query, 12, 400, text_w);
+        text_draw(cr, query, 12, 400, C_FG, 0.95,
+                  text_x, 22.0, ALIGN_LEFT, 0.0);
+        if (a->searching && a->caret_on) {
+            char prefix[128];
+            int cur = a->search_cursor;
+            size_t len = strlen(a->search);
+            if (cur < 0) cur = 0;
+            if (cur > (int)len) cur = (int)len;
+            snprintf(prefix, sizeof prefix, "%.*s", cur, a->search);
+            double cw = text_width(cr, prefix, 12, 400, 0.0);
+            if (cw > text_w) cw = text_w;
+            rgba(cr, C_ACCENT, 0.95);
+            cairo_set_line_width(cr, 1.5);
+            cairo_move_to(cr, text_x + cw, 18.5);
+            cairo_line_to(cr, text_x + cw, 35.5);
+            cairo_stroke(cr);
+        }
+    } else {
+        icon_draw(a, cr, "system-search-symbolic", 14.0, bx + 9.0, 20.5);
+        text_draw(cr, "Search", 12, 400, C_FAINT, 0.9,
+                  text_x, 22.0, ALIGN_LEFT, 0.0);
+    }
 
     rgba(cr, C_FG, 0.06);
     cairo_set_line_width(cr, 1.0);
@@ -5234,6 +6001,13 @@ static double file_top_y(App *a)
     return TOOLBAR_H + COLHEAD_H;
 }
 
+/* Search results get a taller two-line row; all list geometry goes through
+ * this so hover, hit-testing, scrolling and the scrollbar stay in step. */
+static double list_row_h(App *a)
+{
+    return a->search_active ? SEARCH_ROW_H : ROW_H;
+}
+
 static void icon_grid(App *a, IconGrid *g)
 {
     double margin = a->view == VIEW_TILES ? 8.0 : 10.0;
@@ -5270,7 +6044,8 @@ static int list_scroll_max(App *a)
     /* Only count rows that fit completely. Adding one here let the last row
      * land past the clip bottom at maximum scroll, so it was cut off with no
      * way to scroll it fully into view. */
-    int visible = (int)((a->WIN_H - file_top_y(a) - STATUS_H) / ROW_H);
+    int visible = (int)((a->WIN_H - file_top_y(a) - STATUS_H) /
+                        list_row_h(a));
     if (visible < 1) visible = 1;
     int max = a->n_ents - visible;
     return max > 0 ? max : 0;
@@ -5306,7 +6081,7 @@ static int scrollbar_geom(App *a, double *rx, double *ry, double *rw,
         total = (a->n_ents + g.cols - 1) / g.cols;
     } else {
         max = list_scroll_max(a);
-        visible = (int)((bottom - top) / ROW_H);
+        visible = (int)((bottom - top) / list_row_h(a));
         if (visible < 1) visible = 1;
         total = a->n_ents;
     }
@@ -5554,7 +6329,10 @@ static void draw_files(App *a, cairo_t *cr)
 {
     double x0 = SIDEBAR_W;
     double vw = a->WIN_W - SIDEBAR_W;
-    int icon_view = a->view == VIEW_ICONS || a->view == VIEW_TILES;
+    /* Search results always use list rows so the containing directory fits
+     * underneath the name. The normal view is restored when search closes. */
+    int icon_view = !a->search_active &&
+                    (a->view == VIEW_ICONS || a->view == VIEW_TILES);
     double list_y = file_top_y(a);
     double list_h = a->WIN_H - list_y - STATUS_H;
 
@@ -5568,9 +6346,10 @@ static void draw_files(App *a, cairo_t *cr)
         cairo_line_to(cr, a->WIN_W, TOOLBAR_H + COLHEAD_H - 0.5);
         cairo_stroke(cr);
 
-        text_draw(cr, "Name", 11, 600, C_DIM, 0.95, x0 + 46.0,
+        text_draw(cr, a->search_active ? "Name / Location" : "Name",
+                  11, 600, C_DIM, 0.95, x0 + 46.0,
                   TOOLBAR_H + 7.0, ALIGN_LEFT, 0.5);
-        if (a->view == VIEW_DETAILS) {
+        if (a->view == VIEW_DETAILS && !a->search_active) {
             text_draw(cr, "Date modified", 11, 600, C_DIM, 0.95,
                       x0 + 350.0, TOOLBAR_H + 7.0, ALIGN_LEFT, 0.5);
             text_draw(cr, "Type", 11, 600, C_DIM, 0.95,
@@ -5670,7 +6449,8 @@ static void draw_files(App *a, cairo_t *cr)
             cairo_stroke(cr);
         }
     } else {
-        int visible = (int)(list_h / ROW_H) + 1;
+        double rh = list_row_h(a);
+        int visible = (int)(list_h / rh) + 1;
         a->scroll_max = list_scroll_max(a);
         int first = a->scroll;
         if (first < 0) first = 0;
@@ -5686,57 +6466,157 @@ static void draw_files(App *a, cairo_t *cr)
             int i = base + k;
             if (i < 0 || i >= a->n_ents) continue;
             Entry *e = &a->ents[i];
-            double y = list_y + (k - frac) * ROW_H;
-            if (a->selected[i]) {
-                rgba(cr, C_ACCENT, 0.20);
-                cairo_rectangle(cr, x0, y, vw, ROW_H);
+            double y = list_y + (k - frac) * rh;
+
+            if (a->search_active) {
+                /* Result rows are rounded cards with room for two lines, so
+                 * hover/selection targets are much larger than a normal row. */
+                double hx = x0 + 8.0, hy = y + 3.0;
+                double hw = vw - 20.0, hh = rh - 6.0;
+                if (a->selected[i] || i == a->hover_row) {
+                    rounded_rect(cr, hx, hy, hw, hh, 8.0);
+                    rgba(cr, a->selected[i] ? C_ACCENT : C_FG,
+                         a->selected[i] ? 0.22 : 0.065);
+                    cairo_fill(cr);
+                    if (a->selected[i] && !post_sel_entry_pending(a, i)) {
+                        rgba(cr, C_ACCENT, 0.9);
+                        cairo_rectangle(cr, hx, hy + 8.0, 2.0, hh - 16.0);
+                        cairo_fill(cr);
+                    }
+                }
+                if (i > 0) {
+                    rgba(cr, C_FG, 0.035);
+                    cairo_set_line_width(cr, 1.0);
+                    cairo_move_to(cr, hx, y + rh - 0.5);
+                    cairo_line_to(cr, hx + hw, y + rh - 0.5);
+                    cairo_stroke(cr);
+                }
+                rounded_rect(cr, x0 + 16.0, y + 12.0, 32.0, 32.0, 8.0);
+                rgba(cr, C_FG, 0.045);
                 cairo_fill(cr);
-                /* The left rail is the static border here; hide it while the
-                 * segment makes the lap, then bring it back. */
-                if (!post_sel_entry_pending(a, i)) {
-                    rgba(cr, C_ACCENT, 0.9);
-                    cairo_rectangle(cr, x0, y, 2.0, ROW_H);
+                icon_draw_entry(a, cr, e, 24.0, x0 + 20.0, y + 16.0, 0);
+
+                char label[NAME_MAX + 1], dir[PATH_MAX];
+                snprintf(label, sizeof label, "%s", e->name);
+                double label_w = vw - 92.0;
+                ui_ellipsize(cr, label, sizeof label, 13, 600, label_w);
+                text_draw(cr, label, 13, 600, C_FG, 1.0,
+                          x0 + 60.0, y + 21.0, ALIGN_LEFT, 0.0);
+                search_rel_dir(a, e, dir, sizeof dir);
+                ui_ellipsize(cr, dir, sizeof dir, 10.5, 400, label_w);
+                text_draw(cr, dir, 10.5, 400, C_FAINT, 0.85,
+                          x0 + 60.0, y + 39.0, ALIGN_LEFT, 0.0);
+            } else {
+                if (a->selected[i]) {
+                    rgba(cr, C_ACCENT, 0.20);
+                    cairo_rectangle(cr, x0, y, vw, ROW_H);
+                    cairo_fill(cr);
+                    /* The left rail is the static border here; hide it while
+                     * the segment makes the lap, then bring it back. */
+                    if (!post_sel_entry_pending(a, i)) {
+                        rgba(cr, C_ACCENT, 0.9);
+                        cairo_rectangle(cr, x0, y, 2.0, ROW_H);
+                        cairo_fill(cr);
+                    }
+                } else if (i == a->hover_row) {
+                    rgba(cr, C_FG, 0.055);
+                    cairo_rectangle(cr, x0, y, vw, ROW_H);
                     cairo_fill(cr);
                 }
-            } else if (i == a->hover_row) {
-                rgba(cr, C_FG, 0.055);
-                cairo_rectangle(cr, x0, y, vw, ROW_H);
-                cairo_fill(cr);
-            }
-            icon_draw_entry(a, cr, e, 19.0, x0 + 16.0, y + 4.0, 0);
-            char label[NAME_MAX + 1];
-            snprintf(label, sizeof label, "%s", e->name);
-            ui_ellipsize(cr, label, sizeof label, 12, 400, 280.0);
-            /* 19px icons end ~21px below the row origin; align text ink
-             * bottoms with that instead of sitting them near the top. */
-            text_draw(cr, label, 12, 400, C_FG, 1.0,
-                      x0 + 46.0, y + 10.0, ALIGN_LEFT, 0.0);
-            if (a->view == VIEW_DETAILS) {
-                char date[64];
-                fmt_date(date, sizeof date, e->mtime);
-                text_draw(cr, date, 11, 400, C_DIM, 0.85,
-                          x0 + 350.0, y + 11.0, ALIGN_LEFT, 0.0);
-                char type[48];
-                snprintf(type, sizeof type, "%s", e->type);
-                ui_ellipsize(cr, type, sizeof type, 11, 400, 170.0);
-                text_draw(cr, type, 11, 400, C_DIM, 0.85,
-                          x0 + 570.0, y + 11.0, ALIGN_LEFT, 0.0);
-                char sz[32];
-                entry_size_text(a, e, sz, sizeof sz);
-                text_draw(cr, sz, 11, 400, C_DIM, 0.85,
-                          a->WIN_W - 18.0, y + 11.0, ALIGN_RIGHT, 0.0);
+                icon_draw_entry(a, cr, e, 19.0, x0 + 16.0, y + 4.0, 0);
+                char label[NAME_MAX + 1];
+                snprintf(label, sizeof label, "%s", e->name);
+                ui_ellipsize(cr, label, sizeof label, 12, 400, 280.0);
+                /* 19px icons end ~21px below the row origin; align text ink
+                 * bottoms with that instead of sitting them near the top. */
+                text_draw(cr, label, 12, 400, C_FG, 1.0,
+                          x0 + 46.0, y + 10.0, ALIGN_LEFT, 0.0);
+                if (a->view == VIEW_DETAILS) {
+                    char date[64];
+                    fmt_date(date, sizeof date, e->mtime);
+                    text_draw(cr, date, 11, 400, C_DIM, 0.85,
+                              x0 + 350.0, y + 11.0, ALIGN_LEFT, 0.0);
+                    char type[48];
+                    snprintf(type, sizeof type, "%s", e->type);
+                    ui_ellipsize(cr, type, sizeof type, 11, 400, 170.0);
+                    text_draw(cr, type, 11, 400, C_DIM, 0.85,
+                              x0 + 570.0, y + 11.0, ALIGN_LEFT, 0.0);
+                    char sz[32];
+                    entry_size_text(a, e, sz, sizeof sz);
+                    text_draw(cr, sz, 11, 400, C_DIM, 0.85,
+                              a->WIN_W - 18.0, y + 11.0, ALIGN_RIGHT, 0.0);
+                }
             }
             if (a->selected[i] && post_sel_entry_pending(a, i))
                 draw_sel_lap(cr, x0 + 0.5, y + 0.5,
-                             vw - 1.0, ROW_H - 1.0, 3.0, lap_progress);
+                             vw - 1.0, rh - 1.0, 3.0, lap_progress);
         }
     }
 
     if (a->n_ents == 0) {
-        icon_draw(a, cr, "folder", 64.0, a->WIN_W / 2.0 - 32.0,
-                  list_y + 80.0);
-        text_draw(cr, "This folder is empty", 13, 400, C_DIM, 0.8,
-                  a->WIN_W / 2.0, list_y + 160.0, ALIGN_CENTER, 0.2);
+        /* Center the placeholder in the file area, not the whole window, and
+         * derive its box and type sizes from the available content rect so it
+         * stays proportionate when the window is resized. */
+        double rw = DESIGN_W - SIDEBAR_W;
+        double rh = DESIGN_H - TOOLBAR_H - COLHEAD_H - STATUS_H;
+        double s = fmin(vw / rw, list_h / rh);
+        if (s < 0.62) s = 0.62;
+        if (s > 1.65) s = 1.65;
+
+        double bw = fmin(vw * 0.56, 460.0 * s);
+        double bh = fmin(list_h * 0.56, 250.0 * s);
+        if (bw < 220.0) bw = fmin(220.0, vw - 24.0);
+        if (bh < 150.0) bh = fmin(150.0, list_h - 24.0);
+        if (bw < 160.0) bw = vw - 16.0;
+        if (bh < 110.0) bh = list_h - 16.0;
+        if (bw < 40.0) bw = vw;
+        if (bh < 40.0) bh = list_h;
+
+        double bx = x0 + (vw - bw) / 2.0;
+        double by = list_y + (list_h - bh) / 2.0;
+        double cx = bx + bw / 2.0;
+        double cy = by + bh / 2.0;
+
+        double rad = fmin(16.0 * s, bh / 2.0);
+        rounded_rect(cr, bx, by, bw, bh, rad);
+        rgba(cr, C_FG, 0.035);
+        cairo_fill(cr);
+        rgba(cr, C_BORDER, 0.28);
+        cairo_set_line_width(cr, 1.0);
+        rounded_rect(cr, bx + 0.5, by + 0.5, bw - 1.0, bh - 1.0,
+                     rad > 0.5 ? rad - 0.5 : 0.0);
+        cairo_stroke(cr);
+
+        if (a->search_active) {
+            double is = fmax(56.0 * s, 40.0);
+            double ts = fmax(13.0 * s, 11.0);
+            double ss = fmax(10.0 * s, 9.0);
+            double g1 = 16.0 * s, g2 = 8.0 * s;
+            double group_h = is + g1 + ts * 1.25 + g2 + ss * 1.25 + 12.0 * s;
+            double top = cy - group_h / 2.0;
+
+            icon_draw(a, cr, "system-search-symbolic", is,
+                      cx - is / 2.0, top);
+            text_draw(cr, "No matches", ts, 400, C_DIM, 0.85,
+                      cx, top + is + g1, ALIGN_CENTER, 0.2 * s);
+            char where[PATH_MAX], label[PATH_MAX + 8];
+            snprintf(where, sizeof where, "%s", a->cwd);
+            ui_ellipsize(cr, where, sizeof where, ss, 400, bw - 40.0 * s);
+            snprintf(label, sizeof label, "in %s", where);
+            text_draw(cr, label, ss, 400, C_FAINT, 0.7,
+                      cx, top + is + g1 + ts * 1.25 + g2,
+                      ALIGN_CENTER, 0.2 * s);
+        } else {
+            double is = fmax(64.0 * s, 40.0);
+            double ts = fmax(13.0 * s, 11.0);
+            double g1 = 16.0 * s;
+            double group_h = is + g1 + ts * 1.25 + 12.0 * s;
+            double top = cy - group_h / 2.0;
+
+            icon_draw(a, cr, "folder", is, cx - is / 2.0, top);
+            text_draw(cr, "This folder is empty", ts, 400, C_DIM, 0.8,
+                      cx, top + is + g1, ALIGN_CENTER, 0.2 * s);
+        }
     }
     cairo_restore(cr);
 }
@@ -5780,6 +6660,13 @@ static void draw_status(App *a, cairo_t *cr)
     char msg[400];
     if (a->status[0] && mono_sec() - a->status_t < 8.0)
         snprintf(msg, sizeof msg, "%s", a->status);
+    else if (a->search_active && a->search_pending)
+        snprintf(msg, sizeof msg, "Searching for “%s”…", a->search);
+    else if (a->search_active)
+        snprintf(msg, sizeof msg, "%d result%s%s%s",
+                 a->n_ents, a->n_ents == 1 ? "" : "s",
+                 a->search_truncated ? "+" : "",
+                 a->n_selected ? "  •  selected" : "");
     else snprintf(msg, sizeof msg, "%d item%s%s", a->n_ents,
                   a->n_ents == 1 ? "" : "s",
                   a->n_selected ? "  •  selected" : "");
@@ -6353,6 +7240,11 @@ static void main_hover(App *a, double x, double y)
         else if (x >= 126 && x < 156) a->hover_btn = 3;
         else if (x >= 164 && x < 194) a->hover_btn = 4;
     }
+    if (y >= 12.0 && y < 43.0 &&
+        (a->search_active || a->searching)) {
+        double gx = a->WIN_W - 196.0;
+        if (x >= gx && x < gx + 30.0) a->hover_btn = 5;
+    }
     a->hover_row = -1;
     if (!a->sb_hover && x >= SIDEBAR_W && y >= file_top_y(a) &&
         y < a->WIN_H - STATUS_H) {
@@ -6360,7 +7252,8 @@ static void main_hover(App *a, double x, double y)
             int idx;
             if (icon_grid_hit(a, x, y, &idx)) a->hover_row = idx;
         } else {
-            int r = (int)((y - file_top_y(a)) / ROW_H) + scroll_hit(a);
+            int r = (int)((y - file_top_y(a)) / list_row_h(a)) +
+                    scroll_hit(a);
             if (r >= 0 && r < a->n_ents) a->hover_row = r;
         }
     }
@@ -6516,17 +7409,34 @@ static void main_click(App *a, uint32_t serial, double x, double y, int button)
             }
         }
         double sx = a->WIN_W - 156.0;
-        if (x >= sx - 76.0 && x < sx - 46.0) {
-            action_activate(a, A_VIEW_DETAILS);
-            return;
+        if (a->search_active || a->searching) {
+            /* The button beside the search box cancels the current search. */
+            if (x >= sx - 40.0 && x < sx - 10.0) {
+                search_stop(a);
+                return;
+            }
+        } else {
+            if (x >= sx - 76.0 && x < sx - 46.0) {
+                action_activate(a, A_VIEW_DETAILS);
+                return;
+            }
+            if (x >= sx - 40.0 && x < sx - 10.0) {
+                action_activate(a, A_VIEW_ICONS);
+                return;
+            }
         }
-        if (x >= sx - 40.0 && x < sx - 10.0) {
-            action_activate(a, A_VIEW_ICONS);
+        /* Clicking the search box clears it and leaves a blinking caret. */
+        double bx = a->search_box_w > 0.0 ? a->search_box_x :
+                    a->WIN_W - 156.0;
+        double bw = a->search_box_w > 0.0 ? a->search_box_w : 144.0;
+        if (x >= bx && x < bx + bw) {
+            search_start(a);
             return;
         }
         double px = 208.0, pw = a->WIN_W - px - 248.0;
         if (pw < 120.0) pw = 120.0;
         if (x >= px && x < px + pw) {
+            if (a->search_active) search_stop(a);
             a->editing_path = 1;
             a->path_cursor = (int)strlen(a->path_edit);
             a->dirty = 1;
@@ -6549,8 +7459,7 @@ static void main_click(App *a, uint32_t serial, double x, double y, int button)
             if (id >= 0) {
                 if (a->sort_by == id) a->sort_desc = !a->sort_desc;
                 else a->sort_by = id;
-                qsort(a->ents, (size_t)a->n_ents, sizeof *a->ents, entry_cmp);
-                a->dirty = 1;
+                search_sort(a);
             }
         }
         return;
@@ -6634,7 +7543,7 @@ static void main_click(App *a, uint32_t serial, double x, double y, int button)
         return;
     }
 
-    int row = (int)((y - file_top_y(a)) / ROW_H) + scroll_hit(a);
+    int row = (int)((y - file_top_y(a)) / list_row_h(a)) + scroll_hit(a);
     if (row < 0 || row >= a->n_ents) return;
     int ctrl = mod_active(a, XKB_MOD_NAME_CTRL);
     int shift = mod_active(a, XKB_MOD_NAME_SHIFT);
@@ -6737,8 +7646,8 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
                     else a->sel = idx;
                 }
             } else {
-                int r = (int)((a->pointer_y - file_top_y(a)) / ROW_H)
-                        + scroll_hit(a);
+                int r = (int)((a->pointer_y - file_top_y(a)) /
+                              list_row_h(a)) + scroll_hit(a);
                 if (r >= 0 && r < a->n_ents) {
                     a->ctx_kind = CTX_FILE;
                     a->ctx_index = r;
@@ -6964,7 +7873,8 @@ static void scroll_index_into_view(App *a, int idx)
         if (first_row > max_row) first_row = max_row;
         a->scroll = first_row * g.cols;
     } else {
-        int visible = (int)((a->WIN_H - file_top_y(a) - STATUS_H) / ROW_H);
+        int visible = (int)((a->WIN_H - file_top_y(a) - STATUS_H) /
+                            list_row_h(a));
         if (visible < 1) visible = 1;
         if (idx < a->scroll) a->scroll = idx;
         if (idx >= a->scroll + visible) a->scroll = idx - visible + 1;
@@ -6989,25 +7899,10 @@ static void apply_pending_select(App *a)
     }
 }
 
-static void keyboard_key(void *data, struct wl_keyboard *keyboard,
-                         uint32_t serial, uint32_t time, uint32_t key,
-                         uint32_t state)
+/* One key action, shared by real key presses and client-side repeats. */
+static void keyboard_key_apply(App *a, xkb_keysym_t sym, uint32_t key,
+                               int ctrl, int alt, int shift)
 {
-    (void)keyboard; (void)time;
-    App *a = data;
-    a->clip_serial = serial;
-    if (state != WL_KEYBOARD_KEY_STATE_PRESSED || !a->xkb_state) return;
-    /* A transfer runs in a child process; keep navigation and shortcuts live
-     * while it copies. Starting a second transfer is still blocked separately
-     * in do_paste(). */
-    xkb_keysym_t sym = xkb_state_key_get_one_sym(a->xkb_state, key + 8);
-    int ctrl = xkb_state_mod_name_is_active(a->xkb_state, XKB_MOD_NAME_CTRL,
-                                            XKB_STATE_MODS_DEPRESSED) > 0;
-    int alt = xkb_state_mod_name_is_active(a->xkb_state, XKB_MOD_NAME_ALT,
-                                           XKB_STATE_MODS_DEPRESSED) > 0;
-    int shift = xkb_state_mod_name_is_active(a->xkb_state, XKB_MOD_NAME_SHIFT,
-                                             XKB_STATE_MODS_DEPRESSED) > 0;
-
     if (a->menu) { menu_key(a, sym); return; }
 
     if (a->dialog.type) {
@@ -7021,6 +7916,48 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
         } else if (a->dialog.type != 3)
             line_edit(a, a->dialog.text, sizeof a->dialog.text,
                       &a->dialog.cursor, sym, key);
+        return;
+    }
+
+    /* Handle focus-changing shortcuts before the search field gets the key,
+     * otherwise Ctrl+L/Ctrl+F would be inserted as text. */
+    if (ctrl && sym == XKB_KEY_f) {
+        if (a->searching) { a->searching = 0; a->dirty = 1; }
+        else search_start(a);
+        return;
+    }
+    if (ctrl && sym == XKB_KEY_l) {
+        if (a->search_active) search_stop(a);
+        a->editing_path = 1;
+        a->path_cursor = (int)strlen(a->path_edit);
+        a->dirty = 1;
+        return;
+    }
+
+    if (a->searching) {
+        if (ctrl || alt) return;
+        if (sym == XKB_KEY_Escape) { search_stop(a); return; }
+        if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
+            int idx = a->sel >= 0 && a->sel < a->n_ents ? a->sel :
+                      (a->n_ents > 0 ? 0 : -1);
+            if (idx >= 0) {
+                select_one(a, idx);
+                a->ctx_kind = CTX_FILE;
+                a->ctx_index = idx;
+                action_activate(a, A_OPEN);
+            }
+            return;
+        }
+        /* Up/Down move through results; line_edit keeps Left/Right/Home/End. */
+        if (sym == XKB_KEY_Down) { select_move(a, 1, shift); return; }
+        if (sym == XKB_KEY_Up) { select_move(a, -1, shift); return; }
+        char prev_query[sizeof a->search];
+        snprintf(prev_query, sizeof prev_query, "%s", a->search);
+        line_edit(a, a->search, sizeof a->search, &a->search_cursor,
+                  sym, key);
+        if (strcmp(prev_query, a->search))
+            search_build(a, a->search);
+        search_caret_reset(a);
         return;
     }
     if (a->editing_path) {
@@ -7046,12 +7983,6 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
     if (ctrl && sym == XKB_KEY_e) {
         int list_on = a->view == VIEW_LIST || a->view == VIEW_DETAILS;
         action_activate(a, list_on ? A_VIEW_ICONS : A_VIEW_DETAILS);
-        return;
-    }
-    if (ctrl && sym == XKB_KEY_l) {
-        a->editing_path = 1;
-        a->path_cursor = (int)strlen(a->path_edit);
-        a->dirty = 1;
         return;
     }
     if (alt && sym == XKB_KEY_Left) { go_hist(a, -1); return; }
@@ -7098,6 +8029,96 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
             a->dirty = 1;
         }
         return;
+    }
+}
+
+static void keyboard_cancel_repeat(App *a)
+{
+    a->repeat_active = 0;
+    a->repeat_key = 0;
+}
+
+static int key_has_text(App *a, uint32_t key)
+{
+    char txt[8];
+    int n = a->xkb_state ? xkb_state_key_get_utf8(
+        a->xkb_state, key + 8, txt, sizeof txt - 1) : 0;
+    return n > 0 && (unsigned char)txt[0] >= 0x20;
+}
+
+/* Only repeat keys that are safe to repeat. Text fields get characters and
+ * editing keys; the file list only repeats Up/Down (never Delete/Return). */
+static int keyboard_repeatable(App *a, xkb_keysym_t sym, uint32_t key,
+                               int ctrl, int alt)
+{
+    if (ctrl || alt || !a->xkb_state) return 0;
+    if (sym == XKB_KEY_Escape || sym == XKB_KEY_Return ||
+        sym == XKB_KEY_KP_Enter || sym == XKB_KEY_q || sym == XKB_KEY_Q ||
+        sym == XKB_KEY_F2 || sym == XKB_KEY_F5) return 0;
+    int editing_key = sym == XKB_KEY_BackSpace || sym == XKB_KEY_Delete ||
+                      sym == XKB_KEY_KP_Delete || sym == XKB_KEY_Left ||
+                      sym == XKB_KEY_Right || sym == XKB_KEY_Up ||
+                      sym == XKB_KEY_Down || sym == XKB_KEY_Home ||
+                      sym == XKB_KEY_End;
+    if (a->dialog.type || a->searching || a->editing_path)
+        return editing_key || key_has_text(a, key);
+    return sym == XKB_KEY_Up || sym == XKB_KEY_Down;
+}
+
+static void keyboard_repeat_tick(App *a)
+{
+    if (!a->repeat_active || !a->xkb_state) return;
+    double now = mono_sec();
+    if (now < a->repeat_at) return;
+    if (!keyboard_repeatable(a, a->repeat_sym, a->repeat_key,
+                             a->repeat_ctrl, a->repeat_alt)) {
+        keyboard_cancel_repeat(a);
+        return;
+    }
+    keyboard_key_apply(a, a->repeat_sym, a->repeat_key,
+                       a->repeat_ctrl, a->repeat_alt, a->repeat_shift);
+    double period = a->repeat_rate > 0.0 ? 1.0 / a->repeat_rate : 0.02;
+    a->repeat_at += period;
+    if (a->repeat_at < now) a->repeat_at = now + period; /* long stall */
+}
+
+static void keyboard_key(void *data, struct wl_keyboard *keyboard,
+                         uint32_t serial, uint32_t time, uint32_t key,
+                         uint32_t state)
+{
+    (void)keyboard; (void)time;
+    App *a = data;
+    a->clip_serial = serial;
+    if (state == WL_KEYBOARD_KEY_STATE_RELEASED) {
+        if (a->repeat_active && a->repeat_key == key)
+            keyboard_cancel_repeat(a);
+        return;
+    }
+    if (state != WL_KEYBOARD_KEY_STATE_PRESSED || !a->xkb_state) return;
+    /* A transfer runs in a child process; keep navigation and shortcuts live
+     * while it copies. Starting a second transfer is still blocked separately
+     * in do_paste(). */
+    xkb_keysym_t sym = xkb_state_key_get_one_sym(a->xkb_state, key + 8);
+    int ctrl = xkb_state_mod_name_is_active(a->xkb_state, XKB_MOD_NAME_CTRL,
+                                            XKB_STATE_MODS_DEPRESSED) > 0;
+    int alt = xkb_state_mod_name_is_active(a->xkb_state, XKB_MOD_NAME_ALT,
+                                           XKB_STATE_MODS_DEPRESSED) > 0;
+    int shift = xkb_state_mod_name_is_active(a->xkb_state, XKB_MOD_NAME_SHIFT,
+                                             XKB_STATE_MODS_DEPRESSED) > 0;
+
+    keyboard_key_apply(a, sym, key, ctrl, alt, shift);
+
+    if (keyboard_repeatable(a, sym, key, ctrl, alt)) {
+        a->repeat_key = key;
+        a->repeat_sym = sym;
+        a->repeat_ctrl = ctrl;
+        a->repeat_alt = alt;
+        a->repeat_shift = shift;
+        a->repeat_active = 1;
+        a->repeat_at = mono_sec() +
+                       (a->repeat_delay > 0.0 ? a->repeat_delay : 0.25);
+    } else {
+        keyboard_cancel_repeat(a);
     }
 }
 
@@ -7964,19 +8985,22 @@ static void keyboard_keymap(void *data, struct wl_keyboard *kb,
     xkb_keymap_unref(a->xkb_keymap);
     a->xkb_keymap = km;
     a->xkb_state = st;
+    keyboard_cancel_repeat(a);
 }
 
 static void keyboard_enter(void *data, struct wl_keyboard *kb,
                            uint32_t serial, struct wl_surface *surface,
                            struct wl_array *keys)
 {
-    (void)data; (void)kb; (void)serial; (void)surface; (void)keys;
+    (void)kb; (void)serial; (void)surface; (void)keys;
+    keyboard_cancel_repeat(data);
 }
 
 static void keyboard_leave(void *data, struct wl_keyboard *kb,
                            uint32_t serial, struct wl_surface *surface)
 {
-    (void)data; (void)kb; (void)serial; (void)surface;
+    (void)kb; (void)serial; (void)surface;
+    keyboard_cancel_repeat(data);
 }
 
 static void keyboard_modifiers(void *data, struct wl_keyboard *kb,
@@ -7989,10 +9013,16 @@ static void keyboard_modifiers(void *data, struct wl_keyboard *kb,
         xkb_state_update_mask(a->xkb_state, dep, lat, lock, 0, 0, group);
 }
 
+/* jtlabwc sends repeat_info but leaves key event generation to clients. */
 static void keyboard_repeat(void *data, struct wl_keyboard *kb,
                             int32_t rate, int32_t delay)
 {
-    (void)data; (void)kb; (void)rate; (void)delay;
+    (void)kb;
+    App *a = data;
+    a->repeat_rate = rate > 0 ? (double)rate : 50.0;
+    a->repeat_delay = delay > 0 ? (double)delay / 1000.0 : 0.25;
+    if (a->repeat_active)
+        a->repeat_at = mono_sec() + a->repeat_delay;
 }
 
 static const struct wl_keyboard_listener keyboard_listener = {
@@ -8850,7 +9880,7 @@ static Entry *dnd_drop_entry(App *a, double x, double y)
     if (a->view == VIEW_ICONS || a->view == VIEW_TILES) {
         if (!icon_grid_hit(a, x, y, &idx)) return NULL;
     } else {
-        idx = (int)((y - file_top_y(a)) / ROW_H) + scroll_hit(a);
+        idx = (int)((y - file_top_y(a)) / list_row_h(a)) + scroll_hit(a);
     }
     if (idx < 0 || idx >= a->n_ents) return NULL;
     Entry *e = &a->ents[idx];
@@ -9636,7 +10666,7 @@ static int pump_events(App *a, int timeout_ms)
     fds[nfds].revents = 0;
     nfds++;
 
-    int ctl_idx = -1, client_idx = -1, thumb_idx = -1;
+    int ctl_idx = -1, client_idx = -1, thumb_idx = -1, search_idx = -1;
     int ino_idx = -1, clip_idx = -1, dbus_first = -1;
     if (a->ctl_fd >= 0) {
         ctl_idx = nfds;
@@ -9661,6 +10691,13 @@ static int pump_events(App *a, int timeout_ms)
     if (thumb_wake[0] >= 0) {
         thumb_idx = nfds;
         fds[nfds].fd = thumb_wake[0];
+        fds[nfds].events = POLLIN;
+        fds[nfds].revents = 0;
+        nfds++;
+    }
+    if (search_wake[0] >= 0) {
+        search_idx = nfds;
+        fds[nfds].fd = search_wake[0];
         fds[nfds].events = POLLIN;
         fds[nfds].revents = 0;
         nfds++;
@@ -9711,6 +10748,16 @@ static int pump_events(App *a, int timeout_ms)
         int ms = left <= 0.0 ? 0 : (int)(left * 1000.0);
         if (ms < timeout_ms || timeout_ms < 0) timeout_ms = ms;
     }
+    if (a->repeat_active) {
+        double left = a->repeat_at - mono_sec();
+        int ms = left <= 0.0 ? 0 : (int)(left * 1000.0);
+        if (ms < timeout_ms || timeout_ms < 0) timeout_ms = ms;
+    }
+    if (a->searching) {
+        double left = a->caret_next - mono_sec();
+        int ms = left <= 0.0 ? 0 : (int)(left * 1000.0);
+        if (ms < timeout_ms || timeout_ms < 0) timeout_ms = ms;
+    }
 
     int ret = poll(fds, (nfds_t)nfds, timeout_ms);
     int poll_errno = errno;
@@ -9758,6 +10805,8 @@ static int pump_events(App *a, int timeout_ms)
         thumb_wake_drain();
         thumb_collect(a);
     }
+    if (search_idx >= 0 && (fds[search_idx].revents & POLLIN))
+        search_collect(a);
     menu_handle_done(a, a->menu);
     return 0;
 }
@@ -9816,6 +10865,7 @@ static void app_cleanup(App *a)
         a->dbus_ctx = NULL;
     }
 
+    search_thread_stop();
     thumb_stop_worker();
     icon_cache_clear(a);
     for (int i = 0; i < THUMB_CACHE_MAX; i++) {
@@ -9880,6 +10930,8 @@ static void app_cleanup(App *a)
 
     for (int i = 0; i < a->hist_n; i++) free(a->hist[i]);
     free(a->ents);
+    free(a->dir_ents);
+    free(a->search_ents);
     free(a->selected);
 }
 
@@ -9961,6 +11013,8 @@ int main(int argc, char **argv)
     app.last_click_row = -1;
     app.border_anim_enabled = 0;
     app.ctx_kind = CTX_NONE;
+    app.repeat_rate = 50.0;   /* overridden by wl_keyboard.repeat_info */
+    app.repeat_delay = 0.25;
     g_app_signal = &app;
 
     signal(SIGINT, on_signal);
@@ -9968,8 +11022,10 @@ int main(int argc, char **argv)
     signal(SIGHUP, on_signal);
     signal(SIGPIPE, SIG_IGN);
     thumb_start();
+    search_thread_start();
 
     state_load(&app);
+    app.saved_view = app.view;
     scroll_snap(&app);
     if (!accent_cli(&argc, argv)) {
         app_cleanup(&app);
@@ -10030,9 +11086,14 @@ int main(int argc, char **argv)
          * position first and added a full extra frame of latency. */
         int lap_active = post_sel_anim_active(&app) ||
                          menu_tree_anim_active(app.menu);
-        int timeout_ms = (animating || lap_active) ? SEL_LAP_TICK_MS : 100;
+        int timeout_ms = 100;
+        if (animating || lap_active) timeout_ms = SEL_LAP_TICK_MS;
+        else if (app.search_pending) timeout_ms = SEARCH_SPIN_TICK_MS;
         if (pump_events(&app, timeout_ms) < 0) break;
 
+        keyboard_repeat_tick(&app);
+        search_caret_tick(&app);
+        if (app.search_pending) app.dirty = 1;   /* advance the spinner */
         watch_tick(&app);
         if (app.status[0] && mono_sec() - app.status_t >= 8.0) {
             app.status[0] = '\0';
