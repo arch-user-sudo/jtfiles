@@ -6686,6 +6686,8 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
 
     if (a->pointer_target == 2 && a->pointer_menu) {
         Menu *m = a->pointer_menu;
+        /* Right/middle clicking the popup does nothing and leaves it open. */
+        if (button != BTN_LEFT) return;
         int idx = menu_hit(m, m->px, m->py);
         if (button != BTN_LEFT || idx < 0) {
             /* The grab delivers outside clicks to the popup surface. */
