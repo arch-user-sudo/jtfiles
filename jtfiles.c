@@ -1303,6 +1303,9 @@ struct Menu {
     double scroll_t;        /* timestamp of the last easing step */
     int scroll_prev;        /* target seen at the previous step */
     int hover, anchor_x, anchor_y;
+    /* Popup-border lap on menu open. */
+    double popup_anim_start;
+    int popup_anim_active;
     int px, py;
     int n;
     MenuItem items[40];
@@ -3701,6 +3704,10 @@ static void popup_configure(void *data, struct xdg_popup *popup,
 {
     (void)popup; (void)x; (void)y; (void)w; (void)h;
     Menu *m = data;
+    if (!m->configured) {
+        m->popup_anim_start = mono_sec();
+        m->popup_anim_active = 1;
+    }
     m->configured = 1;
     m->dirty = 1;
 }
@@ -5298,6 +5305,42 @@ static void lap_rounded_rect(cairo_t *cr, double x, double y,
     cairo_close_path(cr);
 }
 
+/* Menu popups use the same timing for a lap around their own border. */
+static double menu_popup_elapsed_ms(const Menu *m)
+{
+    if (!m || m->popup_anim_start <= 0.0) return SEL_LAP_MS;
+    return (mono_sec() - m->popup_anim_start) * 1000.0;
+}
+
+static int menu_popup_anim_active(const Menu *m)
+{
+    return m && m->popup_anim_active && menu_popup_elapsed_ms(m) < SEL_LAP_MS;
+}
+
+static void menu_tree_tick(Menu *m, double now)
+{
+    if (!m) return;
+    if (m->popup_anim_active && m->popup_anim_start > 0.0) {
+        if ((now - m->popup_anim_start) * 1000.0 >= SEL_LAP_MS) {
+            m->popup_anim_active = 0;
+            m->popup_anim_start = 0.0;
+        }
+        /* Keep repainting while the segment moves, and once more for the
+         * clean static border after it finishes. */
+        m->dirty = 1;
+    }
+    for (int i = 0; i < m->n; i++) menu_tree_tick(m->items[i].sub, now);
+}
+
+static int menu_tree_anim_active(const Menu *m)
+{
+    if (!m) return 0;
+    if (menu_popup_anim_active(m)) return 1;
+    for (int i = 0; i < m->n; i++)
+        if (menu_tree_anim_active(m->items[i].sub)) return 1;
+    return 0;
+}
+
 /* One accent segment runs clockwise from bottom center all the way around
  * the selection border, with the same fade, width, halo and timing as jtwpi. */
 static void draw_sel_lap(cairo_t *cr, double x, double y,
@@ -5665,6 +5708,10 @@ static void menu_paint(App *a, Menu *m, ShmBuf *b)
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
     cairo_scale(cr, a->scale, a->scale);
 
+    double popup_ms = menu_popup_elapsed_ms(m);
+    int popup_lap = menu_popup_anim_active(m);
+    double popup_progress = popup_lap ? popup_ms / SEL_LAP_MS : 1.0;
+
     cairo_set_source_rgba(cr, 0, 0, 0, 0.45);
     rounded_rect(cr, 2.0, 4.0, m->w, m->h, 8.0);
     cairo_fill(cr);
@@ -5681,6 +5728,11 @@ static void menu_paint(App *a, Menu *m, ShmBuf *b)
     cairo_set_line_width(cr, 1.0);
     rounded_rect(cr, 0.5, 0.5, m->w - 1.0, m->h - 1.0, 7.5);
     cairo_stroke(cr);
+    if (popup_lap) {
+        /* Inset enough for the 3px lap stroke to stay inside the buffer. */
+        draw_sel_lap(cr, 2.5, 2.5, m->w - 5.0, m->h - 5.0, 6.0,
+                     popup_progress);
+    }
 
     /* Only the rows scroll; the popup frame and later scrollbar stay put. */
     cairo_save(cr);
@@ -9718,7 +9770,8 @@ int main(int argc, char **argv)
          * first, then advance easing against the freshly-updated targets and
          * paint once. Ticking in frame_done_app instead painted a stale
          * position first and added a full extra frame of latency. */
-        int lap_active = post_sel_anim_active(&app);
+        int lap_active = post_sel_anim_active(&app) ||
+                         menu_tree_anim_active(app.menu);
         int timeout_ms = (animating || lap_active) ? SEL_LAP_TICK_MS : 100;
         if (pump_events(&app, timeout_ms) < 0) break;
 
@@ -9737,6 +9790,7 @@ int main(int argc, char **argv)
         }
 
         animating = menu_scroll_tick(app.menu);
+        menu_tree_tick(app.menu, mono_sec());
         if (scroll_tick(&app)) animating = 1;
         if (side_hover_tick(&app)) animating = 1;
         if (post_sel_anim_tick(&app)) animating = 1;
