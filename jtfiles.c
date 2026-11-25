@@ -88,6 +88,13 @@
 #define COLHEAD_H 30.0
 #define ROW_H 28.0
 
+/* Post-transfer selection lap: same timing and geometry as jtwpi. */
+#define SEL_LAP_MS       900.0
+#define SEL_LAP_TICK_MS  16
+#define SEL_LAP_WIDTH    3.0
+#define SEL_LAP_MIN_SEG  14.0
+#define SEL_LAP_MAX_SEG  48.0
+
 #define ICON_CACHE_MAX 192
 #define THUMB_CACHE_MAX 48
 #define THUMB_QUEUE_MAX 128
@@ -1506,6 +1513,8 @@ struct App {
     char post_dir[PATH_MAX];
     char post_names[64][NAME_MAX + 1];
     int n_post_names, post_armed;
+    /* >0: lap running; -1: lap already played for this batch. */
+    double post_sel_anim_start;
     char *hist[64];
     int hist_n, hist_cap, hist_pos;
     Entry *ents;
@@ -1756,6 +1765,7 @@ static void post_xfer_disarm(App *a)
     a->post_armed = 0;
     a->n_post_names = 0;
     a->post_dir[0] = 0;
+    a->post_sel_anim_start = 0;
 }
 
 static void post_xfer_arm(App *a, const char *dir,
@@ -1771,6 +1781,7 @@ static void post_xfer_arm(App *a, const char *dir,
         a->n_post_names++;
     }
     if (a->n_post_names) a->post_armed = 1;
+    a->post_sel_anim_start = 0; /* starts when the entries actually appear */
 }
 
 /* Called at the end of every dir_load(), including the inotify-driven ones
@@ -1794,8 +1805,41 @@ static void apply_post_xfer_selection(App *a)
             a->sel = a->anchor = first;
             scroll_index_into_view(a, first);
         }
+        if (a->post_sel_anim_start == 0.0)
+            a->post_sel_anim_start = mono_sec();
         a->dirty = 1;
     }
+}
+
+static int post_sel_entry_pending(const App *a, int idx)
+{
+    if (!a || !a->post_armed || !a->selected || idx < 0 || idx >= a->n_ents)
+        return 0;
+    if (a->post_sel_anim_start <= 0.0) return 0;
+    for (int k = 0; k < a->n_post_names; k++)
+        if (!strcmp(a->ents[idx].name, a->post_names[k])) return 1;
+    return 0;
+}
+
+static double post_sel_elapsed_ms(const App *a)
+{
+    if (!a || a->post_sel_anim_start <= 0.0) return SEL_LAP_MS;
+    return (mono_sec() - a->post_sel_anim_start) * 1000.0;
+}
+
+static int post_sel_anim_active(const App *a)
+{
+    return post_sel_elapsed_ms(a) < SEL_LAP_MS;
+}
+
+/* Mark a repaint each tick and retire the batch once the lap completes. */
+static int post_sel_anim_tick(App *a)
+{
+    if (!a || a->post_sel_anim_start <= 0.0) return 0;
+    if (post_sel_elapsed_ms(a) > SEL_LAP_MS)
+        a->post_sel_anim_start = -1;
+    a->dirty = 1;
+    return 1;
 }
 
 /* Turn a file path into "open its parent, highlight this name".  Keep the
@@ -3987,6 +4031,15 @@ static void action_activate(App *a, int id)
         clipboard_publish(a);
         status_set(a, "%s %d item%s", id == A_CUT ? "Cut" : "Copied",
                    a->n_clip, a->n_clip == 1 ? "" : "s");
+        /* Confirm the staged entries with the same full-lap accent used after
+         * a paste/drop.  They are already selected, so start here rather than
+         * waiting for a rescan to re-apply the selection. */
+        char paths[64][PATH_MAX];
+        int arm_n = a->n_clip < 64 ? a->n_clip : 64;
+        for (int i = 0; i < arm_n; i++)
+            snprintf(paths[i], PATH_MAX, "%s", a->clipboard[i]);
+        post_xfer_arm(a, a->cwd, paths, arm_n);
+        if (a->post_armed) a->post_sel_anim_start = mono_sec();
         break;
     }
     case A_COPY_PATH:
@@ -5227,6 +5280,62 @@ static void select_in_rect(App *a, double x0, double y0, double x1, double y1,
     }
 }
 
+/* Same path start as jtwpi's jti_rounded_rect(): just past the top-left
+ * radius, clockwise.  That keeps the bottom-center dash offset identical. */
+static void lap_rounded_rect(cairo_t *cr, double x, double y,
+                             double w, double h, double r)
+{
+    double d = 2.0 * r;
+    if (d > w) d = w;
+    if (d > h) d = h;
+    r = d / 2.0;
+    cairo_new_path(cr);
+    cairo_move_to(cr, x + r, y);
+    cairo_arc(cr, x + w - r, y + r, r, -PI / 2.0, 0);
+    cairo_arc(cr, x + w - r, y + h - r, r, 0, PI / 2.0);
+    cairo_arc(cr, x + r, y + h - r, r, PI / 2.0, PI);
+    cairo_arc(cr, x + r, y + r, r, PI, 3.0 * PI / 2.0);
+    cairo_close_path(cr);
+}
+
+/* One accent segment runs clockwise from bottom center all the way around
+ * the selection border, with the same fade, width, halo and timing as jtwpi. */
+static void draw_sel_lap(cairo_t *cr, double x, double y,
+                         double w, double h, double r, double progress)
+{
+    double top = w - 2.0 * r, side = h - 2.0 * r;
+    double perimeter = 2.0 * (top + side) + 2.0 * PI * r;
+    if (perimeter <= 2.0) return;
+
+    double start = 1.5 * top + side + PI * r;
+    double travelled = progress * perimeter;
+    double seg = fmin(SEL_LAP_MAX_SEG,
+                      fmax(SEL_LAP_MIN_SEG, perimeter / 10.0));
+    seg = fmin(seg, perimeter / 2.0);
+
+    double alpha = 1.0;
+    if (progress < 0.08) alpha = progress / 0.08;
+    else if (progress > 0.92) alpha = (1.0 - progress) / 0.08;
+    if (alpha <= 0.0) return;
+
+    cairo_save(cr);
+    double dash[2] = { seg, perimeter - seg };
+    cairo_set_dash(cr, dash, 2, -fmod(start + travelled, perimeter));
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+
+    /* cairo_stroke() clears the path, so rebuild it for the crisp core. */
+    lap_rounded_rect(cr, x, y, w, h, r);
+    rgba(cr, C_ACCENT_HI, alpha * 0.18);
+    cairo_set_line_width(cr, SEL_LAP_WIDTH + 5.0);
+    cairo_stroke(cr);
+
+    lap_rounded_rect(cr, x, y, w, h, r);
+    rgba(cr, C_ACCENT_HI, alpha);
+    cairo_set_line_width(cr, SEL_LAP_WIDTH);
+    cairo_stroke(cr);
+    cairo_restore(cr);
+}
+
 static void draw_files(App *a, cairo_t *cr)
 {
     double x0 = SIDEBAR_W;
@@ -5260,6 +5369,9 @@ static void draw_files(App *a, cairo_t *cr)
     cairo_save(cr);
     cairo_rectangle(cr, x0, list_y, vw, list_h);
     cairo_clip(cr);
+
+    double lap_progress = post_sel_anim_active(a) ?
+                          post_sel_elapsed_ms(a) / SEL_LAP_MS : 0.0;
 
     if (icon_view) {
         IconGrid g;
@@ -5299,6 +5411,15 @@ static void draw_files(App *a, cairo_t *cr)
                 rounded_rect(cr, cell_x + 4.0, cell_y + 2.0,
                              g.tw - 8.0, g.th - 6.0, 8.0);
                 cairo_fill(cr);
+                /* Keep the fill, but let the travelling segment stand in for
+                 * the static border until the lap finishes. */
+                if (a->selected[i] && !post_sel_entry_pending(a, i)) {
+                    rgba(cr, C_ACCENT_HI, 0.95);
+                    cairo_set_line_width(cr, 1.2);
+                    rounded_rect(cr, cell_x + 4.0, cell_y + 2.0,
+                                 g.tw - 8.0, g.th - 6.0, 8.0);
+                    cairo_stroke(cr);
+                }
             }
 
             double icon_top = a->view == VIEW_TILES ? 6.0 : 8.0;
@@ -5315,6 +5436,9 @@ static void draw_files(App *a, cairo_t *cr)
             if (lines[1][0])
                 text_draw(cr, lines[1], 12, 400, C_FG, 1.0,
                           cx, label_y + 14.0, ALIGN_CENTER, 0.0);
+            if (a->selected[i] && post_sel_entry_pending(a, i))
+                draw_sel_lap(cr, cell_x + 4.0, cell_y + 2.0,
+                             g.tw - 8.0, g.th - 6.0, 8.0, lap_progress);
         }
 
         if (a->drag_select) {
@@ -5353,9 +5477,13 @@ static void draw_files(App *a, cairo_t *cr)
                 rgba(cr, C_ACCENT, 0.20);
                 cairo_rectangle(cr, x0, y, vw, ROW_H);
                 cairo_fill(cr);
-                rgba(cr, C_ACCENT, 0.9);
-                cairo_rectangle(cr, x0, y, 2.0, ROW_H);
-                cairo_fill(cr);
+                /* The left rail is the static border here; hide it while the
+                 * segment makes the lap, then bring it back. */
+                if (!post_sel_entry_pending(a, i)) {
+                    rgba(cr, C_ACCENT, 0.9);
+                    cairo_rectangle(cr, x0, y, 2.0, ROW_H);
+                    cairo_fill(cr);
+                }
             } else if (i == a->hover_row) {
                 rgba(cr, C_FG, 0.055);
                 cairo_rectangle(cr, x0, y, vw, ROW_H);
@@ -5384,6 +5512,9 @@ static void draw_files(App *a, cairo_t *cr)
                 text_draw(cr, sz, 11, 400, C_DIM, 0.85,
                           a->WIN_W - 18.0, y + 11.0, ALIGN_RIGHT, 0.0);
             }
+            if (a->selected[i] && post_sel_entry_pending(a, i))
+                draw_sel_lap(cr, x0 + 0.5, y + 0.5,
+                             vw - 1.0, ROW_H - 1.0, 3.0, lap_progress);
         }
     }
 
@@ -6844,6 +6975,21 @@ static const struct zxdg_toplevel_decoration_v1_listener deco_listener = {
 
 static const struct wl_surface_listener surface_listener;
 
+/* Secondary windows keep their opening size.  Min/max already pins the edges;
+ * also undo any maximize/fullscreen state the compositor tries to apply. */
+static void fixed_toplevel_reject_states(struct xdg_toplevel *t,
+                                         struct wl_array *states)
+{
+    if (!t || !states) return;
+    int32_t *state;
+    wl_array_for_each(state, states) {
+        if (*state == XDG_TOPLEVEL_STATE_MAXIMIZED)
+            xdg_toplevel_unset_maximized(t);
+        else if (*state == XDG_TOPLEVEL_STATE_FULLSCREEN)
+            xdg_toplevel_unset_fullscreen(t);
+    }
+}
+
 static void frame_done_xfer(void *data, struct wl_callback *cb, uint32_t time)
 {
     (void)time;
@@ -6881,12 +7027,11 @@ static void xfer_toplevel_configure(void *data, struct xdg_toplevel *t,
                                     int32_t width, int32_t height,
                                     struct wl_array *states)
 {
-    (void)t; (void)states;
+    /* Transient windows are fixed-size: ignore any size proposed by a resize
+     * configure and keep the dimensions we opened with. */
+    (void)width; (void)height;
+    fixed_toplevel_reject_states(t, states);
     Transfer *x = data;
-    if (width > 0 && height > 0) {
-        x->w = width < 420 ? 420 : width;
-        x->h = height < 180 ? 180 : height;
-    }
     /* Keep the window geometry equal to the buffer so the SSD frame and the
      * themed content line up on every configure. */
     if (x->xdg_surface)
@@ -6959,7 +7104,8 @@ static void dialog_toplevel_configure(void *data, struct xdg_toplevel *t,
                                       int32_t width, int32_t height,
                                       struct wl_array *states)
 {
-    (void)width; (void)height; (void)states;
+    (void)width; (void)height;
+    fixed_toplevel_reject_states(t, states);
     DialogWin *d = data;
     App *a = d->app;
     if (a->dialog.type)
@@ -6992,6 +7138,10 @@ static void dialog_window_open(App *a)
 
     if (d->surface) {
         xdg_toplevel_set_title(d->toplevel, a->dialog.title);
+        /* A reused dialog can switch between the short and tall layouts, so
+         * re-assert the lock for its new fixed size. */
+        xdg_toplevel_set_min_size(d->toplevel, d->w, d->h);
+        xdg_toplevel_set_max_size(d->toplevel, d->w, d->h);
         xdg_surface_set_window_geometry(d->xdg_surface, 0, 0, d->w, d->h);
         d->dirty = 1;
         return;
@@ -9568,7 +9718,9 @@ int main(int argc, char **argv)
          * first, then advance easing against the freshly-updated targets and
          * paint once. Ticking in frame_done_app instead painted a stale
          * position first and added a full extra frame of latency. */
-        if (pump_events(&app, animating ? 16 : 100) < 0) break;
+        int lap_active = post_sel_anim_active(&app);
+        int timeout_ms = (animating || lap_active) ? SEL_LAP_TICK_MS : 100;
+        if (pump_events(&app, timeout_ms) < 0) break;
 
         watch_tick(&app);
         if (app.status[0] && mono_sec() - app.status_t >= 8.0) {
@@ -9587,6 +9739,7 @@ int main(int argc, char **argv)
         animating = menu_scroll_tick(app.menu);
         if (scroll_tick(&app)) animating = 1;
         if (side_hover_tick(&app)) animating = 1;
+        if (post_sel_anim_tick(&app)) animating = 1;
 
         if (app.dirty) {
             /* Only clear the bit after a real paint; a failed draw must not
