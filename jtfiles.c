@@ -2416,9 +2416,16 @@ static void dir_load(App *a, const char *path)
 static void hist_push(App *a, const char *path)
 {
     if (a->hist_pos >= 0 && a->hist_pos < a->hist_n &&
-        !strcmp(a->hist[a->hist_pos], path)) return;
-    for (int i = a->hist_pos + 1; i < a->hist_n; i++) free(a->hist[i]);
-    a->hist_n = a->hist_pos + 1;
+        a->hist[a->hist_pos] && !strcmp(a->hist[a->hist_pos], path)) return;
+
+    /* hist_pos starts at 0 on a zeroed App, before any entry exists. Clamp
+     * the truncation point to the real history length so the first navigate
+     * does not leave a NULL slot at index 0. */
+    int keep = a->hist_pos + 1;
+    if (keep < 0) keep = 0;
+    if (keep > a->hist_n) keep = a->hist_n;
+    for (int i = keep; i < a->hist_n; i++) free(a->hist[i]);
+    a->hist_n = keep;
     if (a->hist_n >= 64) {
         free(a->hist[0]);
         for (int i = 1; i < a->hist_n; i++) a->hist[i - 1] = a->hist[i];
@@ -2446,7 +2453,7 @@ static void go_hist(App *a, int dir)
 {
     post_xfer_disarm(a);
     int p = a->hist_pos + dir;
-    if (p < 0 || p >= a->hist_n) return;
+    if (p < 0 || p >= a->hist_n || !a->hist[p]) return;
     a->hist_pos = p;
     dir_load(a, a->hist[p]);
     snprintf(a->path_edit, sizeof a->path_edit, "%s", a->cwd);
@@ -11026,6 +11033,7 @@ int main(int argc, char **argv)
     app.clip_read.fd = -1;
     app.sel = -1;
     app.anchor = -1;
+    app.hist_pos = -1;
     app.sidebar_drive = -1;
     app.hover_side = -1;
     app.side_hov_last = -2;
