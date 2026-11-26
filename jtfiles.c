@@ -518,7 +518,7 @@ enum {
     ICO_FILE, ICO_IMAGE, ICO_VIDEO, ICO_AUDIO, ICO_ARCHIVE,
     ICO_PDF, ICO_CODE, ICO_EXEC, ICO_DISC, ICO_DRIVE,
     ICO_BACK, ICO_FORWARD, ICO_UP, ICO_REFRESH, ICO_SEARCH,
-    ICO_LIST, ICO_GRID
+    ICO_LIST, ICO_GRID, ICO_MENU
 };
 
 static int icon_kind(const char *n)
@@ -547,6 +547,9 @@ static int icon_kind(const char *n)
         return ICO_REFRESH;
     if (strstr(n, "search"))
         return ICO_SEARCH;
+    if (strstr(n, "menu") || strstr(n, "settings") ||
+        strstr(n, "preferences"))
+        return ICO_MENU;
     if (strstr(n, "view-list") || strstr(n, "list-view"))
         return ICO_LIST;
     if (strstr(n, "view-grid") || strstr(n, "grid-view") ||
@@ -791,6 +794,18 @@ static void icon_refresh(cairo_t *cr)
     cairo_fill(cr);
 }
 
+static void icon_menu(cairo_t *cr)
+{
+    rgba(cr, C_ACCENT, 0.95);
+    cairo_set_line_width(cr, 3.0);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    for (int i = 0; i < 3; i++) {
+        cairo_move_to(cr, 15.0, 17.0 + (double)i * 7.0);
+        cairo_line_to(cr, 33.0, 17.0 + (double)i * 7.0);
+        cairo_stroke(cr);
+    }
+}
+
 static void icon_search(cairo_t *cr)
 {
     rgba(cr, C_ACCENT, 0.95);
@@ -920,7 +935,8 @@ static int icon_toolbar_name(const char *n)
            !strcmp(n, "go-next-symbolic") ||
            !strcmp(n, "go-up-symbolic") ||
            !strcmp(n, "user-home-symbolic") ||
-           !strcmp(n, "view-refresh-symbolic");
+           !strcmp(n, "view-refresh-symbolic") ||
+           !strcmp(n, "menu-symbolic");
 }
 
 static cairo_surface_t *icon_load(const char *name, int target)
@@ -1007,6 +1023,9 @@ static cairo_surface_t *icon_load(const char *name, int target)
         break;
     case ICO_SEARCH:
         icon_search(cr);
+        break;
+    case ICO_MENU:
+        icon_menu(cr);
         break;
     case ICO_LIST:
         icon_view(cr, 0);
@@ -1196,6 +1215,9 @@ static cairo_surface_t *icon_load_big(const char *name, int target)
     case ICO_SEARCH:
         icon_search(cr);
         break;
+    case ICO_MENU:
+        icon_menu(cr);
+        break;
     case ICO_LIST:
         icon_view(cr, 0);
         break;
@@ -1235,7 +1257,7 @@ enum {
     A_GROUP_NONE, A_GROUP_TYPE, A_GROUP_DATE,
     A_NEW_FOLDER, A_NEW_TEXT, A_NEW_SHORTCUT, A_NEW_ZIP,
     A_REFRESH, A_PASTE, A_UNDO, A_SELECT_ALL, A_HIDDEN, A_SMOOTH_SCROLL,
-    A_GO_BACK, A_GO_FORWARD, A_GO_UP, A_GO_HOME,
+    A_GO_BACK, A_GO_FORWARD, A_GO_UP, A_GO_HOME, A_MENU,
     A_DRIVE_OPEN, A_DRIVE_MOUNT, A_DRIVE_UNMOUNT, A_DRIVE_EJECT,
     A_QUIT
 };
@@ -5028,6 +5050,14 @@ static void action_activate(App *a, int id)
         if (home) navigate(a, home, 1);
         break;
     }
+    case A_MENU:
+        if (a->menu) menu_close_tree(a);
+        else {
+            a->ctx_kind = CTX_BACKGROUND;
+            a->ctx_index = -1;
+            menu_open_root(a, a->pointer_serial, 88, 44);
+        }
+        break;
     case A_DRIVE_OPEN:
         if (d) {
             if (d->mounted) navigate(a, d->mount, 1);
@@ -5726,22 +5756,22 @@ static void draw_toolbar(App *a, cairo_t *cr)
     /* No opaque panel fill: the window-wide background gradient continues
      * through the toolbar. Only the bottom hairline separates the two. */
 
-    struct { int x; const char *icon; int id; } btns[] = {
-        { 12, "go-previous-symbolic", A_GO_BACK },
-        { 50, "go-next-symbolic", A_GO_FORWARD },
-        { 88, "go-up-symbolic", A_GO_UP },
-        { 126, "user-home-symbolic", A_GO_HOME },
-        { 164, "view-refresh-symbolic", A_REFRESH },
+    struct { int x; const char *icon; int id; double size; } btns[] = {
+        { 12, "go-previous-symbolic", A_GO_BACK, 17.0 },
+        { 50, "go-next-symbolic", A_GO_FORWARD, 17.0 },
+        { 88, "menu-symbolic", A_MENU, 20.0 },
     };
     for (unsigned i = 0; i < sizeof btns / sizeof btns[0]; i++) {
+        double sz = btns[i].size;
         rounded_rect(cr, btns[i].x, 12, 30, 30, 7);
         rgba(cr, C_FG, a->hover_btn == (int)i ? 0.10 : 0.04);
         cairo_fill(cr);
-        icon_draw(a, cr, btns[i].icon, 17.0, btns[i].x + 6.5, 18.5);
+        icon_draw(a, cr, btns[i].icon, sz,
+                  btns[i].x + (30.0 - sz) / 2.0, 12.0 + (30.0 - sz) / 2.0);
         (void)btns[i].id;
     }
 
-    double px = 208.0, pw = a->WIN_W - px - 248.0;
+    double px = 132.0, pw = a->WIN_W - px - 248.0;
     if (pw < 120.0) pw = 120.0;
     ui_card_fill(cr, px, 12, pw, 31, 8);
     icon_draw(a, cr, "folder", 15.0, px + 9.0, 20.0);
@@ -7228,12 +7258,10 @@ static void main_hover(App *a, double x, double y)
                   x >= sx - 5.0 && x <= sx + sw + 5.0 &&
                   y >= sy && y <= sy + sh;
     a->hover_btn = -1;
-    if (y >= 0 && y < TOOLBAR_H && x >= 0 && x < 200) {
+    if (y >= 0 && y < TOOLBAR_H && x >= 0 && x < 132) {
         if (x >= 12 && x < 42) a->hover_btn = 0;
         else if (x >= 50 && x < 80) a->hover_btn = 1;
         else if (x >= 88 && x < 118) a->hover_btn = 2;
-        else if (x >= 126 && x < 156) a->hover_btn = 3;
-        else if (x >= 164 && x < 194) a->hover_btn = 4;
     }
     if (y >= 12.0 && y < 43.0 &&
         (a->search_active || a->searching)) {
@@ -7395,9 +7423,8 @@ static void main_click(App *a, uint32_t serial, double x, double y, int button)
     if (button != BTN_LEFT) return;
 
     if (y >= 12.0 && y < 43.0) {
-        static const int ids[] = { A_GO_BACK, A_GO_FORWARD, A_GO_UP,
-                                   A_GO_HOME, A_REFRESH };
-        for (int i = 0; i < 5; i++) {
+        static const int ids[] = { A_GO_BACK, A_GO_FORWARD, A_MENU };
+        for (int i = 0; i < 3; i++) {
             if (x >= 12.0 + i * 38.0 && x < 42.0 + i * 38.0) {
                 action_activate(a, ids[i]);
                 return;
@@ -7428,7 +7455,7 @@ static void main_click(App *a, uint32_t serial, double x, double y, int button)
             search_start(a);
             return;
         }
-        double px = 208.0, pw = a->WIN_W - px - 248.0;
+        double px = 132.0, pw = a->WIN_W - px - 248.0;
         if (pw < 120.0) pw = 120.0;
         if (x >= px && x < px + pw) {
             if (a->search_active) search_stop(a);
