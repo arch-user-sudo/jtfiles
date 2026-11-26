@@ -5127,6 +5127,9 @@ static void menu_open_root(App *a, uint32_t serial, int x, int y)
         mitem(m, 0, A_REFRESH, "Refresh", "F5", 1);
         mitem(m, 0, A_PASTE, "Paste", "Ctrl+V", clipboard_has(a));
         msep(m);
+        mitem(m, 3, A_HIDDEN, "Hidden files", "Ctrl+H", 1)->checked =
+            a->show_hidden;
+        msep(m);
         mitem(m, 0, A_PROPERTIES, "Properties", "", 1);
     }
     n = m->n;
