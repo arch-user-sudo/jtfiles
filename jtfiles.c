@@ -247,6 +247,14 @@ static void ui_card_fill(cairo_t *cr, double x, double y,
     cairo_stroke(cr);
 }
 
+/* Quick Access and file-list selections share this soft accent box. */
+static void selected_box(cairo_t *cr, double x, double y, double w, double h)
+{
+    rgba(cr, C_ACCENT, 0.18);
+    rounded_rect(cr, x, y, w, h, 6.0);
+    cairo_fill(cr);
+}
+
 static double mono_sec(void)
 {
     struct timespec ts;
@@ -5908,11 +5916,7 @@ static void draw_sidebar(App *a, cairo_t *cr)
     for (int i = 0; i < nf; i++, y += 28) {
         int sel = !strcmp(a->cwd, favorites[i]);
         float hv = a->side_hov[i];
-        if (sel) {
-            rgba(cr, C_ACCENT, 0.18);
-            rounded_rect(cr, 7.0, y - 3.0, SIDEBAR_W - 14.0, 26.0, 6.0);
-            cairo_fill(cr);
-        }
+        if (sel) selected_box(cr, 7.0, y - 3.0, SIDEBAR_W - 14.0, 26.0);
         side_hover_paint(cr, y, 26.0, hv, 0);
         icon_draw(a, cr, place_icon(favorites[i]), 17.0, 14.0, y);
         char label[200];
@@ -5926,11 +5930,7 @@ static void draw_sidebar(App *a, cairo_t *cr)
     for (int i = 0; i < np; i++, y += 28) {
         int sel = !strcmp(a->cwd, places[i]);
         float hv = a->side_hov[nf + i];
-        if (sel) {
-            rgba(cr, C_ACCENT, 0.18);
-            rounded_rect(cr, 7.0, y - 3.0, SIDEBAR_W - 14.0, 26.0, 6.0);
-            cairo_fill(cr);
-        }
+        if (sel) selected_box(cr, 7.0, y - 3.0, SIDEBAR_W - 14.0, 26.0);
         side_hover_paint(cr, y, 26.0, hv, 0);
         icon_draw(a, cr, place_icon(places[i]), 17.0, 14.0, y);
         char label[128];
@@ -6468,21 +6468,20 @@ static void draw_files(App *a, cairo_t *cr)
             Entry *e = &a->ents[i];
             double y = list_y + (k - frac) * rh;
 
+            double sel_x = x0 + 7.0, sel_y = y + 1.0;
+            double sel_w = vw - 14.0, sel_h = 26.0, sel_r = 6.0;
             if (a->search_active) {
                 /* Result rows are rounded cards with room for two lines, so
                  * hover/selection targets are much larger than a normal row. */
                 double hx = x0 + 8.0, hy = y + 3.0;
                 double hw = vw - 20.0, hh = rh - 6.0;
-                if (a->selected[i] || i == a->hover_row) {
-                    rounded_rect(cr, hx, hy, hw, hh, 8.0);
-                    rgba(cr, a->selected[i] ? C_ACCENT : C_FG,
-                         a->selected[i] ? 0.22 : 0.065);
+                sel_x = hx; sel_y = hy; sel_w = hw; sel_h = hh;
+                if (a->selected[i])
+                    selected_box(cr, hx, hy, hw, hh);
+                else if (i == a->hover_row) {
+                    rounded_rect(cr, hx, hy, hw, hh, 6.0);
+                    rgba(cr, C_FG, 0.065);
                     cairo_fill(cr);
-                    if (a->selected[i] && !post_sel_entry_pending(a, i)) {
-                        rgba(cr, C_ACCENT, 0.9);
-                        cairo_rectangle(cr, hx, hy + 8.0, 2.0, hh - 16.0);
-                        cairo_fill(cr);
-                    }
                 }
                 if (i > 0) {
                     rgba(cr, C_FG, 0.035);
@@ -6500,27 +6499,22 @@ static void draw_files(App *a, cairo_t *cr)
                 snprintf(label, sizeof label, "%s", e->name);
                 double label_w = vw - 92.0;
                 ui_ellipsize(cr, label, sizeof label, 13, 600, label_w);
-                text_draw(cr, label, 13, 600, C_FG, 1.0,
-                          x0 + 60.0, y + 21.0, ALIGN_LEFT, 0.0);
+                /* Two text lines are vertically centered in the 56px card,
+                 * so the location line keeps real breathing room at the
+                 * bottom instead of sitting on the border. */
+                text_draw(cr, label, 13, 600,
+                          a->selected[i] ? C_ACCENT : C_FG, 1.0,
+                          x0 + 60.0, y + 12.0, ALIGN_LEFT, 0.0);
                 search_rel_dir(a, e, dir, sizeof dir);
                 ui_ellipsize(cr, dir, sizeof dir, 10.5, 400, label_w);
                 text_draw(cr, dir, 10.5, 400, C_FAINT, 0.85,
-                          x0 + 60.0, y + 39.0, ALIGN_LEFT, 0.0);
+                          x0 + 60.0, y + 30.0, ALIGN_LEFT, 0.0);
             } else {
-                if (a->selected[i]) {
-                    rgba(cr, C_ACCENT, 0.20);
-                    cairo_rectangle(cr, x0, y, vw, ROW_H);
-                    cairo_fill(cr);
-                    /* The left rail is the static border here; hide it while
-                     * the segment makes the lap, then bring it back. */
-                    if (!post_sel_entry_pending(a, i)) {
-                        rgba(cr, C_ACCENT, 0.9);
-                        cairo_rectangle(cr, x0, y, 2.0, ROW_H);
-                        cairo_fill(cr);
-                    }
-                } else if (i == a->hover_row) {
-                    rgba(cr, C_FG, 0.055);
-                    cairo_rectangle(cr, x0, y, vw, ROW_H);
+                if (a->selected[i])
+                    selected_box(cr, sel_x, sel_y, sel_w, sel_h);
+                else if (i == a->hover_row) {
+                    rounded_rect(cr, sel_x, sel_y, sel_w, sel_h, sel_r);
+                    rgba(cr, C_FG, 0.045);
                     cairo_fill(cr);
                 }
                 icon_draw_entry(a, cr, e, 19.0, x0 + 16.0, y + 4.0, 0);
@@ -6529,27 +6523,28 @@ static void draw_files(App *a, cairo_t *cr)
                 ui_ellipsize(cr, label, sizeof label, 12, 400, 280.0);
                 /* 19px icons end ~21px below the row origin; align text ink
                  * bottoms with that instead of sitting them near the top. */
-                text_draw(cr, label, 12, 400, C_FG, 1.0,
-                          x0 + 46.0, y + 10.0, ALIGN_LEFT, 0.0);
+                text_draw(cr, label, 12, 400,
+                          a->selected[i] ? C_ACCENT : C_FG, 1.0,
+                          x0 + 46.0, y + 7.0, ALIGN_LEFT, 0.0);
                 if (a->view == VIEW_DETAILS) {
                     char date[64];
                     fmt_date(date, sizeof date, e->mtime);
                     text_draw(cr, date, 11, 400, C_DIM, 0.85,
-                              x0 + 350.0, y + 11.0, ALIGN_LEFT, 0.0);
+                              x0 + 350.0, y + 8.0, ALIGN_LEFT, 0.0);
                     char type[48];
                     snprintf(type, sizeof type, "%s", e->type);
                     ui_ellipsize(cr, type, sizeof type, 11, 400, 170.0);
                     text_draw(cr, type, 11, 400, C_DIM, 0.85,
-                              x0 + 570.0, y + 11.0, ALIGN_LEFT, 0.0);
+                              x0 + 570.0, y + 8.0, ALIGN_LEFT, 0.0);
                     char sz[32];
                     entry_size_text(a, e, sz, sizeof sz);
                     text_draw(cr, sz, 11, 400, C_DIM, 0.85,
-                              a->WIN_W - 18.0, y + 11.0, ALIGN_RIGHT, 0.0);
+                              a->WIN_W - 18.0, y + 8.0, ALIGN_RIGHT, 0.0);
                 }
             }
             if (a->selected[i] && post_sel_entry_pending(a, i))
-                draw_sel_lap(cr, x0 + 0.5, y + 0.5,
-                             vw - 1.0, rh - 1.0, 3.0, lap_progress);
+                draw_sel_lap(cr, sel_x, sel_y, sel_w, sel_h, sel_r,
+                             lap_progress);
         }
     }
 
