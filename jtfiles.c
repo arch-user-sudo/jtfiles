@@ -5715,9 +5715,12 @@ static cairo_surface_t *thumb_render(const char *path, int px)
     snprintf(filter, sizeof filter,
              "scale=%d:%d:force_original_aspect_ratio=decrease", dim, dim);
 
+    /* Do not put "-ss 0" before -i: with the image2 demuxer ffmpeg treats
+     * it as an input seek and can consume the only frame of a JPEG, producing
+     * no output.  The first frame is already the default starting point. */
     char *av[] = {
         (char *)"ffmpeg", (char *)"-v", (char *)"error",
-        (char *)"-ss", (char *)"0", (char *)"-i", (char *)path,
+        (char *)"-i", (char *)path,
         (char *)"-an", (char *)"-frames:v", (char *)"1",
         (char *)"-vf", filter, (char *)"-f", (char *)"image2pipe",
         (char *)"-vcodec", (char *)"png", (char *)"-", NULL
