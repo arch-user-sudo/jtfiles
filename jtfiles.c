@@ -757,6 +757,41 @@ static void icon_folder_body(cairo_t *cr)
     cairo_stroke(cr);
 }
 
+/* Folder shown while a drag hovers over it: the tab lifts into an open lid.
+ * At open=0 the geometry is identical to icon_folder_body(). */
+static void icon_folder_body_open(cairo_t *cr, double open)
+{
+    if (open <= 0.0) {
+        icon_folder_body(cr);
+        return;
+    }
+    if (open > 1.0) open = 1.0;
+
+    rounded_rect(cr, 5.0, 17.0, 38.0, 25.0, 4.0);
+    icon_accent_fill(cr, 5.0, 17.0, 38.0, 25.0);
+    rounded_rect(cr, 5.6, 17.6, 36.8, 23.8, 3.6);
+    rgba(cr, C_ACCENT_LO, 0.9);
+    cairo_set_line_width(cr, 1.1);
+    cairo_stroke(cr);
+
+    /* Dark inner lip makes the open folder readable at small list sizes. */
+    rounded_rect(cr, 7.0, 18.4, 34.0, 4.4, 2.2);
+    rgba(cr, C_ACCENT_LO, 0.78);
+    cairo_fill(cr);
+
+    cairo_save(cr);
+    cairo_translate(cr, 5.0, 17.0);
+    cairo_rotate(cr, -0.62 * open);
+    rounded_rect(cr, 0.0, -5.0, 18.0, 8.0, 2.5);
+    rgba(cr, C_ACCENT_HI, 0.98);
+    cairo_fill(cr);
+    rounded_rect(cr, 0.4, -4.6, 17.2, 7.2, 2.2);
+    rgba(cr, C_ACCENT_LO, 0.80);
+    cairo_set_line_width(cr, 1.0);
+    cairo_stroke(cr);
+    cairo_restore(cr);
+}
+
 static void icon_home_glyph(cairo_t *cr)
 {
     rgba(cr, C_ON_ACCENT, 0.88);
@@ -1595,6 +1630,9 @@ typedef struct ClipWrite {
 /* What is under an active drop point. */
 enum { DND_DROP_NONE, DND_DROP_FILE, DND_DROP_DIR, DND_DROP_NOOP };
 
+#define DND_FOLDER_OPEN_MS  190
+#define DND_FOLDER_CLOSE_MS 130
+
 struct App {
     struct wl_display *display;
     struct wl_registry *registry;
@@ -1639,6 +1677,10 @@ struct App {
     double dnd_drop_x, dnd_drop_y;      /* last enter/motion coordinates */
     int dnd_drop_kind;                  /* current drop target, see DND_DROP_* */
     char dnd_drop_dir[PATH_MAX];        /* directory the drop would land in */
+    /* Folder whose icon is opening/closing under the drag pointer. */
+    char dnd_folder_path[PATH_MAX];
+    double dnd_folder_t0;
+    int dnd_folder_open;                /* 1 opening/open, 0 closing */
     char dnd_paths[64][PATH_MAX];       /* snapshot of our outgoing drag payload */
     int n_dnd_paths;
 
@@ -1847,6 +1889,11 @@ static void dnd_source_update_actions(App *a);
 static void dnd_offer_update_actions(App *a);
 static int  dnd_drop_target(App *a, double x, double y, char dir[PATH_MAX]);
 static void dnd_target_refresh(App *a);
+static int  dnd_folder_anim_active(App *a);
+static void dnd_folder_anim_tick(App *a);
+static void dnd_folder_anim_stop(App *a);
+static void dnd_folder_anim_clear(App *a);
+static double dnd_folder_open_amount(App *a, const char *path);
 static void sort_freeze_dir(App *a, const char *dir);
 
 /* ---- sidebar hover easing (driven by wl_surface.frame / vsync) ------- */
@@ -2044,12 +2091,107 @@ static void dnd_offer_update_actions(App *a)
     wl_data_offer_set_actions(a->dnd_offer, supported, preferred);
 }
 
+static double dnd_folder_elapsed_ms(App *a)
+{
+    return (mono_sec() - a->dnd_folder_t0) * 1000.0;
+}
+
+static double dnd_folder_ease_out(double p)
+{
+    if (p <= 0.0) return 0.0;
+    if (p >= 1.0) return 1.0;
+    p = 1.0 - p;
+    return 1.0 - p * p * p;
+}
+
+static double dnd_folder_ease_in(double p)
+{
+    if (p <= 0.0) return 0.0;
+    if (p >= 1.0) return 1.0;
+    return p * p;
+}
+
+static int dnd_folder_anim_active(App *a)
+{
+    if (!a->dnd_folder_path[0]) return 0;
+    double dur = a->dnd_folder_open ? DND_FOLDER_OPEN_MS
+                                    : DND_FOLDER_CLOSE_MS;
+    return dnd_folder_elapsed_ms(a) < dur;
+}
+
+static void dnd_folder_anim_tick(App *a)
+{
+    if (!a->dnd_folder_path[0]) return;
+    double dur = a->dnd_folder_open ? DND_FOLDER_OPEN_MS
+                                    : DND_FOLDER_CLOSE_MS;
+    if (dnd_folder_elapsed_ms(a) < dur) {
+        a->dirty = 1;
+        return;
+    }
+    if (!a->dnd_folder_open) {
+        a->dnd_folder_path[0] = 0;
+        a->dnd_folder_t0 = 0.0;
+        a->dnd_folder_open = 1;
+        a->dirty = 1;
+    }
+}
+
+/* Animate the folder under the drag pointer.  Repeated motion events over the
+ * same icon must not restart the open animation on every frame. */
+static void dnd_folder_anim_set(App *a, const char *path, int open)
+{
+    if (!path || !*path) {
+        dnd_folder_anim_stop(a);
+        return;
+    }
+    if (a->dnd_folder_path[0] && !strcmp(a->dnd_folder_path, path) &&
+        a->dnd_folder_open == open)
+        return;
+    snprintf(a->dnd_folder_path, sizeof a->dnd_folder_path, "%s", path);
+    a->dnd_folder_open = open;
+    a->dnd_folder_t0 = mono_sec();
+    a->dirty = 1;
+}
+
+static void dnd_folder_anim_stop(App *a)
+{
+    if (!a->dnd_folder_path[0] || !a->dnd_folder_open) return;
+    a->dnd_folder_open = 0;
+    a->dnd_folder_t0 = mono_sec();
+    a->dirty = 1;
+}
+
+static void dnd_folder_anim_clear(App *a)
+{
+    if (!a->dnd_folder_path[0]) return;
+    a->dnd_folder_path[0] = 0;
+    a->dnd_folder_t0 = 0.0;
+    a->dnd_folder_open = 1;
+    a->dirty = 1;
+}
+
+static double dnd_folder_open_amount(App *a, const char *path)
+{
+    if (!a->dnd_folder_path[0] || !path || strcmp(a->dnd_folder_path, path))
+        return 0.0;
+    double ms = dnd_folder_elapsed_ms(a);
+    if (a->dnd_folder_open) {
+        if (ms <= 0.0) return 0.0;
+        if (ms >= DND_FOLDER_OPEN_MS) return 1.0;
+        return dnd_folder_ease_out(ms / DND_FOLDER_OPEN_MS);
+    }
+    if (ms <= 0.0) return 1.0;
+    if (ms >= DND_FOLDER_CLOSE_MS) return 0.0;
+    return 1.0 - dnd_folder_ease_in(ms / DND_FOLDER_CLOSE_MS);
+}
+
 static void dnd_target_refresh(App *a)
 {
     char dir[PATH_MAX] = { 0 };
     int kind = DND_DROP_NONE;
     if (a->dnd_target_surface == a->surface)
         kind = dnd_drop_target(a, a->dnd_drop_x, a->dnd_drop_y, dir);
+    dnd_folder_anim_set(a, kind == DND_DROP_DIR ? dir : NULL, 1);
     if (!dir[0]) snprintf(dir, sizeof dir, "%s", a->cwd);
     a->dnd_drop_kind = kind;
     snprintf(a->dnd_drop_dir, sizeof a->dnd_drop_dir, "%s", dir);
@@ -5991,9 +6133,32 @@ static void thumbnail_draw(cairo_t *cr, cairo_surface_t *sf,
     cairo_restore(cr);
 }
 
+/* Draw the animated drop-target folder directly instead of a cached icon. */
+static void icon_open_folder_draw(App *a, cairo_t *cr, Entry *e,
+                                  double size, double x, double y, double open)
+{
+    cairo_save(cr);
+    cairo_translate(cr, x, y);
+    cairo_scale(cr, size / 48.0, size / 48.0);
+    icon_folder_body_open(cr, open);
+    int kind = icon_kind(e->icon);
+    if (kind == ICO_HOME) icon_home_glyph(cr);
+    else if (kind == ICO_DESKTOP) icon_desktop_glyph(cr);
+    else if (kind == ICO_DOWNLOADS) icon_downloads_glyph(cr);
+    else if (kind == ICO_FOLDER_LINK) icon_link_badge(cr);
+    cairo_restore(cr);
+    (void)a;
+}
+
 static void icon_draw_entry(App *a, cairo_t *cr, Entry *e,
                             double size, double x, double y, int big)
 {
+    double open = e->is_dir ? dnd_folder_open_amount(a, e->path) : 0.0;
+    if (open > 0.0) {
+        icon_open_folder_draw(a, cr, e, size, x, y, open);
+        return;
+    }
+
     cairo_surface_t *thumb = thumbnail_get(a, e, size);
     if (thumb) {
         thumbnail_draw(cr, thumb, size, x, y);
@@ -10269,6 +10434,7 @@ static void dnd_offer_release(App *a, int success)
     a->dnd_target_surface = NULL;
     a->dnd_drop_kind = DND_DROP_NONE;
     a->dnd_drop_dir[0] = 0;
+    dnd_folder_anim_stop(a);
     data_offer_prune(a, NULL);
 }
 
@@ -10323,6 +10489,7 @@ static void dnd_data_device_leave(void *data, struct wl_data_device *device)
     a->dnd_target_surface = NULL;
     a->dnd_drop_kind = DND_DROP_NONE;
     a->dnd_drop_dir[0] = 0;
+    dnd_folder_anim_stop(a);
     data_offer_prune(a, NULL);
 }
 
@@ -10434,6 +10601,7 @@ static void release_seat(App *a)
     a->n_dnd_paths = 0;
     a->dnd_target_surface = NULL;
     a->dnd_offer_action = WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
+    dnd_folder_anim_clear(a);
     if (a->cursor_device) {
         wp_cursor_shape_device_v1_destroy(a->cursor_device);
         a->cursor_device = NULL;
@@ -11449,7 +11617,8 @@ int main(int argc, char **argv)
          * paint once. Ticking in frame_done_app instead painted a stale
          * position first and added a full extra frame of latency. */
         int lap_active = post_sel_anim_active(&app) ||
-                         menu_tree_anim_active(app.menu);
+                         menu_tree_anim_active(app.menu) ||
+                         dnd_folder_anim_active(&app);
         int timeout_ms = 100;
         if (animating || lap_active) timeout_ms = SEL_LAP_TICK_MS;
         else if (app.search_pending) timeout_ms = SEARCH_SPIN_TICK_MS;
@@ -11484,6 +11653,10 @@ int main(int argc, char **argv)
         if (scroll_tick(&app)) animating = 1;
         if (side_hover_tick(&app)) animating = 1;
         if (post_sel_anim_tick(&app)) animating = 1;
+        if (dnd_folder_anim_active(&app)) {
+            dnd_folder_anim_tick(&app);
+            animating = 1;
+        }
 
         if (app.dirty) {
             /* Only clear the bit after a real paint; a failed draw must not
