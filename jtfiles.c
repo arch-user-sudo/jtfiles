@@ -1777,6 +1777,9 @@ struct App {
     int n_drives;
     int sidebar_drive;
     char sidebar_drive_dev[80]; /* stable identity for the highlighted row */
+    /* Device to open once udisks reports it mounted.  The mount call can
+     * finish before the drive list refresh sees the new mount point. */
+    char pending_mount_dev[80];
     int drives_y0;
     double last_click_t;
     int last_click_row;
@@ -3620,6 +3623,24 @@ static void drive_refresh(App *a)
         }
         if (a->ctx_kind == CTX_DRIVE) a->ctx_index = a->sidebar_drive;
     }
+
+    /* Open a drive as soon as the mount shows up in udisks.  Matching by
+     * device keeps this working even when the callback's object path or mount
+     * point is not in the refreshed list yet. */
+    if (a->pending_mount_dev[0]) {
+        for (int i = 0; i < a->n_drives; i++) {
+            Drive *d = &a->drives[i];
+            if (!d->mounted || !d->mount[0] ||
+                strcmp(d->dev, a->pending_mount_dev)) continue;
+            char path[PATH_MAX];
+            snprintf(path, sizeof path, "%s", d->mount);
+            a->pending_mount_dev[0] = '\0';
+            struct stat st;
+            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+                navigate(a, path, 1);
+            break;
+        }
+    }
     a->dirty = 1;
 }
 
@@ -3685,14 +3706,18 @@ static void job_finish(App *a, Job *j)
     status_set(a, "%s: %s", j->dev, msg);
     drive_refresh(a);
 
-    /* Polkit may hold the mount call for a while. Once udisksd confirms it,
-     * open the drive without making the user click it a second time. */
-    if (j->op == 0 && j->code == 0) {
+    /* Polkit may hold the mount call for a while. drive_refresh() above opens
+     * the drive as soon as the mount appears. If the udisks callback returned
+     * a mount point before the list refresh saw it, use that as a fallback. */
+    if (j->op == 0 && j->code == 0 && j->dev[0] &&
+        a->pending_mount_dev[0] && !strcmp(a->pending_mount_dev, j->dev)) {
         char path[PATH_MAX] = "";
         for (int i = 0; i < a->n_drives; i++) {
             Drive *d = &a->drives[i];
-            if (d->object[0] && j->object[0] && !strcmp(d->object, j->object) &&
-                d->mounted && d->mount[0]) {
+            if (d->mounted && d->mount[0] &&
+                (!strcmp(d->dev, j->dev) ||
+                 (d->object[0] && j->object[0] &&
+                  !strcmp(d->object, j->object)))) {
                 snprintf(path, sizeof path, "%s", d->mount);
                 break;
             }
@@ -3703,7 +3728,34 @@ static void job_finish(App *a, Job *j)
         if (path[0] && stat(path, &st) == 0 && S_ISDIR(st.st_mode))
             navigate(a, path, 1);
     }
+    /* A failed mount must not open a drive mounted later by something else. */
+    if (j->op == 0 && a->pending_mount_dev[0] &&
+        !strcmp(a->pending_mount_dev, j->dev))
+        a->pending_mount_dev[0] = '\0';
     job_release(j);
+}
+
+/* Unmounting the folder we are currently viewing leaves a->cwd pointing into
+ * a filesystem that is about to disappear.  The inotify watch and the next
+ * reload then chase a stale path; step out to the mount point's parent first. */
+static int cwd_on_mount(const App *a, const char *mount)
+{
+    if (!mount || !mount[0] || !strcmp(mount, "/")) return 0;
+    size_t n = strlen(mount);
+    return !strncmp(a->cwd, mount, n) &&
+           (a->cwd[n] == '\0' || a->cwd[n] == '/');
+}
+
+static void leave_mount_dir(App *a, const char *mount)
+{
+    if (!cwd_on_mount(a, mount)) return;
+    char parent[PATH_MAX];
+    snprintf(parent, sizeof parent, "%s", mount);
+    char *slash = strrchr(parent, '/');
+    if (slash && slash != parent) *slash = '\0';
+    else snprintf(parent, sizeof parent, "%s",
+                  getenv("HOME") ? getenv("HOME") : "/");
+    navigate(a, parent, 1);
 }
 
 static void drive_job(App *a, Drive *d, int op)
@@ -3759,6 +3811,10 @@ static void drive_job(App *a, Drive *d, int op)
 
     j->cancel = g_cancellable_new();
     j->active = 1;
+    if (op != 0) leave_mount_dir(a, d->mount);
+    if (op == 0)
+        snprintf(a->pending_mount_dev, sizeof a->pending_mount_dev,
+                 "%s", d->dev);
     GVariant *opts = g_variant_new("a{sv}", NULL); /* floating, consumed by call */
     status_set(a, "%s %s…", op == 0 ? "Mounting" :
                (op == 1 ? "Unmounting" : "Ejecting"), d->dev);
