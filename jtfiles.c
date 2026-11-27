@@ -115,8 +115,12 @@
 #define APPEARANCE_CONFIG "appearance.conf"
 
 #define ICON_CACHE_MAX 192
-#define THUMB_CACHE_MAX 48
+#define THUMB_CACHE_MAX 256
 #define THUMB_QUEUE_MAX 128
+/* When more images are on screen than fit in the cache, only turn over this
+ * many in-view thumbnails per paint.  Evicting all of them each frame made
+ * thumbnails and fallback icons alternate every repaint. */
+#define THUMB_NEW_PER_FRAME 4
 #define COUNT_CACHE_MAX 64
 
 #define C_BG        0x030303
@@ -1422,6 +1426,7 @@ typedef struct {
     unsigned gen;
     cairo_surface_t *sf;
     unsigned long long used;
+    unsigned long long seen;   /* paint frame that last asked for this thumb */
 } ThumbEnt;
 
 typedef struct {
@@ -1841,6 +1846,8 @@ struct App {
 
     ThumbEnt thumbs[THUMB_CACHE_MAX];
     unsigned long long thumb_clock;
+    unsigned long long thumb_frame;
+    int thumb_queued_this_frame;
 
     cairo_t *measure;
     cairo_surface_t *measure_surf;
@@ -6025,12 +6032,14 @@ static cairo_surface_t *thumbnail_get(App *a, Entry *e, double logical)
     if (px < 16) px = 16;
     if (px > 256) px = 256;
     unsigned gen = atomic_load_explicit(&g_thumb_gen, memory_order_relaxed);
+    unsigned long long frame = a->thumb_frame ? a->thumb_frame : 1;
 
     for (int i = 0; i < THUMB_CACHE_MAX; i++) {
         ThumbEnt *t = &a->thumbs[i];
         if (t->state == 2 && t->px == px && t->mtime == e->mtime &&
             t->size == e->size && !strcmp(t->path, e->path)) {
             t->used = ++a->thumb_clock;
+            t->seen = frame;
             return t->sf;
         }
     }
@@ -6038,29 +6047,45 @@ static cairo_surface_t *thumbnail_get(App *a, Entry *e, double logical)
         ThumbEnt *t = &a->thumbs[i];
         if (t->state == 1 && t->gen == gen && t->px == px &&
             t->mtime == e->mtime && t->size == e->size &&
-            !strcmp(t->path, e->path))
+            !strcmp(t->path, e->path)) {
+            t->seen = frame;
             return NULL; /* already queued; draw the fallback icon for now */
+        }
     }
 
+    /* Prefer an empty slot, then a request left over from an old directory,
+     * then a finished thumbnail that is not visible in this paint. */
     int slot = -1;
-    for (int i = 0; i < THUMB_CACHE_MAX; i++)
-        if (a->thumbs[i].state == 0) { slot = i; break; }
+    for (int i = 0; i < THUMB_CACHE_MAX; i++) {
+        ThumbEnt *t = &a->thumbs[i];
+        if (t->state == 0 || (t->state == 1 && t->gen != gen)) {
+            slot = i;
+            break;
+        }
+    }
     if (slot < 0) {
-        int found = 0;
-        slot = 0;
+        for (int i = 0; i < THUMB_CACHE_MAX; i++) {
+            ThumbEnt *t = &a->thumbs[i];
+            if (t->state != 2 || t->seen == frame) continue;
+            if (slot < 0 || t->used < a->thumbs[slot].used) slot = i;
+        }
+    }
+    /* Everything in the cache is on screen.  Turn over only a few slots per
+     * paint, and never evict a queued request before its result arrives.
+     * Otherwise a folder with more images than cache slots flips wholesale
+     * between thumbnails and fallback icons on every frame. */
+    if (slot < 0 && a->thumb_queued_this_frame < THUMB_NEW_PER_FRAME) {
         for (int i = 0; i < THUMB_CACHE_MAX; i++) {
             ThumbEnt *t = &a->thumbs[i];
             if (t->state != 2) continue;
-            if (!found || t->used < a->thumbs[slot].used) {
-                slot = i;
-                found = 1;
-            }
+            if (slot < 0 || t->used < a->thumbs[slot].used) slot = i;
         }
-        if (!found) return NULL;
-        if (a->thumbs[slot].sf) cairo_surface_destroy(a->thumbs[slot].sf);
+        if (slot >= 0) a->thumb_queued_this_frame++;
     }
+    if (slot < 0) return NULL;
 
     ThumbEnt *t = &a->thumbs[slot];
+    if (t->sf) cairo_surface_destroy(t->sf);
     snprintf(t->path, sizeof t->path, "%s", e->path);
     t->mtime = e->mtime;
     t->size = e->size;
@@ -6070,6 +6095,7 @@ static cairo_surface_t *thumbnail_get(App *a, Entry *e, double logical)
     t->failed = 0;
     t->sf = NULL;
     t->used = ++a->thumb_clock;
+    t->seen = frame;
     if (!thumb_submit(t->path, t->mtime, t->size, px, gen)) t->state = 0;
     return NULL;
 }
@@ -7478,6 +7504,10 @@ static int app_draw(App *a)
     cairo_t *cr = cairo_create(surf);
     cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
     cairo_scale(cr, a->scale, a->scale);
+
+    /* One paint = one thumbnail working-set generation.  See thumbnail_get(). */
+    a->thumb_frame++;
+    a->thumb_queued_this_frame = 0;
 
     /* The gradient below is fully opaque, so a separate SOURCE clear only
      * doubled the full-buffer fill on every animation frame. */
@@ -11543,6 +11573,7 @@ int main(int argc, char **argv)
     app.pointer_y = -1.0;
     app.last_click_t = 0.0;
     app.last_click_row = -1;
+    app.thumb_frame = 1;
     app.border_anim_enabled = 0;
     app.ctx_kind = CTX_NONE;
     app.repeat_rate = 50.0;   /* overridden by wl_keyboard.repeat_info */
