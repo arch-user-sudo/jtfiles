@@ -8,7 +8,9 @@
  *   make
  *   ./jtfiles
  *   ./jtfiles '#378484'              (optional accent override)
+ *   ./jtfiles rainbow                (cycle the accent colours)
  *   ./jtfilesctl accent '#378484'    (change accent while running)
+ *   ./jtfilesctl rainbow [on|off|toggle]  (toggle if omitted)
  *
  * Controls:
  *   Click / double-click     select / open
@@ -134,6 +136,11 @@ static unsigned accent_rgb = 0xE8A03C;
 static unsigned accent_hi_rgb = 0xF2B25C;
 static unsigned accent_lo_rgb = 0xCE8A2F;
 static unsigned on_accent_rgb = 0x14100A;
+/* Rainbow mode cycles the accent; the base colour is restored when it is
+ * switched off so an explicit accent is never lost. */
+static unsigned accent_base_rgb = 0xE8A03C;
+static int rainbow_mode = 0;
+static double rainbow_start = 0.0;
 #define C_ACCENT    accent_rgb
 #define C_ACCENT_HI accent_hi_rgb
 #define C_ACCENT_LO accent_lo_rgb
@@ -331,12 +338,70 @@ static unsigned accent_mix(unsigned rgb, unsigned toward, double amount)
     return ((unsigned)r << 16) | ((unsigned)g << 8) | (unsigned)b;
 }
 
-static void accent_set(unsigned rgb)
+/* One full hue wheel every eight seconds, rendered as a saturated RGB
+ * triple.  t is seconds since rainbow mode was switched on. */
+static unsigned rainbow_color(double t)
+{
+    double phase = fmod(t, 8.0);
+    if (phase < 0.0)
+        phase += 8.0;
+    double h = phase * 0.75;
+    int i = (int)h;
+    double f = h - i;
+    double q = 1.0 - f;
+    double r = 0.0, g = 0.0, b = 0.0;
+    switch (i) {
+    case 0: r = 1.0; g = f;   b = 0.0; break;
+    case 1: r = q;   g = 1.0; b = 0.0; break;
+    case 2: r = 0.0; g = 1.0; b = f;   break;
+    case 3: r = 0.0; g = q;   b = 1.0; break;
+    case 4: r = f;   g = 0.0; b = 1.0; break;
+    default:r = 1.0; g = 0.0; b = q;   break;
+    }
+    return ((unsigned)lround(r * 255.0) << 16) |
+           ((unsigned)lround(g * 255.0) << 8) |
+           (unsigned)lround(b * 255.0);
+}
+
+static void accent_apply(unsigned rgb)
 {
     accent_rgb = rgb;
     accent_hi_rgb = accent_mix(rgb, 0xFFFFFF, 0.16);
     accent_lo_rgb = accent_mix(rgb, 0x000000, 0.14);
     on_accent_rgb = accent_ink(rgb);
+}
+
+static void accent_set(unsigned rgb)
+{
+    rainbow_mode = 0;   /* an explicit colour takes over */
+    accent_base_rgb = rgb;
+    accent_apply(rgb);
+}
+
+static void rainbow_set(int on, double t)
+{
+    int was_on = rainbow_mode;
+    rainbow_mode = on ? 1 : 0;
+    if (rainbow_mode) {
+        if (!was_on) {
+            rainbow_start = t;
+            accent_apply(rainbow_color(0.0));
+        }
+    } else if (was_on) {
+        accent_apply(accent_base_rgb);
+    }
+}
+
+/* Returns 1 when the displayed colour actually changed. */
+static int accent_tick(double t)
+{
+    if (!rainbow_mode)
+        return 0;
+    unsigned rgb = rainbow_color(t - rainbow_start);
+    if (rgb == accent_rgb)
+        return 0;
+    accent_apply(rgb);
+    return 1;
 }
 
 /* Set when --accent/positional color is given on the command line. In that
@@ -347,6 +412,8 @@ static time_t accent_conf_mtime;
 /* Same system accent file jtgreeter reads at startup, so the first frame
    already uses the scheme-wide color. Command-line args override it. */
 #define ACCENT_CONF_PATH "/etc/jt/accent.conf"
+/* Same boot flag jtgreeter reads; jtsettings writes it from Appearance. */
+#define RAINBOW_CONF_PATH "/etc/jt/rainbow.conf"
 
 static void accent_load_default(void)
 {
@@ -367,12 +434,38 @@ static void accent_load_default(void)
     fclose(f);
 }
 
+/* Start in the same rainbow state as jtgreeter and JTLab. The accent loaded
+ * above becomes the base colour restored by an explicit "rainbow off". */
+static void rainbow_load_default(void)
+{
+    FILE *f = fopen(RAINBOW_CONF_PATH, "r");
+    if (!f) return;
+    char buf[64];
+    if (fgets(buf, sizeof buf, f)) {
+        char *nl = strpbrk(buf, "\r\n");
+        if (nl) *nl = '\0';
+        static const char prefix[] = "rainbow=";
+        if (!strncmp(buf, prefix, sizeof(prefix) - 1) &&
+            !strcmp(buf + sizeof(prefix) - 1, "on"))
+            rainbow_set(1, mono_sec());
+    }
+    fclose(f);
+}
+
 static int accent_cli(int *argc, char **argv)
 {
     accent_load_default();
+    rainbow_load_default();
     for (int i = 1; i < *argc; i++) {
         const char *value = NULL;
         int consumed = 0;
+        if (!strcmp(argv[i], "--rainbow") || !strcmp(argv[i], "rainbow")) {
+            rainbow_set(1, mono_sec());
+            for (int j = i; j + 1 < *argc; j++) argv[j] = argv[j + 1];
+            (*argc)--;
+            i--;
+            continue;
+        }
         if (!strcmp(argv[i], "--accent")) {
             if (i + 1 >= *argc) {
                 fprintf(stderr, "%s: --accent requires a color\n", argv[0]);
@@ -7147,16 +7240,25 @@ static void menu_mark_dirty(Menu *m)
         menu_mark_dirty(m->items[i].sub);
 }
 
-/* Apply an accent change everywhere it is cached. Shared by the ctl socket
- * and by the config-file watcher so both paths behave identically. */
-static void accent_propagate(App *a, unsigned rgb)
+/* Invalidate everything that caches the accent colour. Used by explicit
+ * accents and by each rainbow hue step. */
+static void accent_visual_refresh(App *a)
 {
-    if (accent_rgb == rgb) return;
-    accent_set(rgb);
     icon_cache_clear(a);
     a->dirty = 1;
     menu_mark_dirty(a->menu);
     a->xfer.dirty = 1;
+}
+
+/* Apply an accent change everywhere it is cached. Shared by the ctl socket
+ * and by the config-file watcher so both paths behave identically. */
+static void accent_propagate(App *a, unsigned rgb)
+{
+    /* An explicit colour must disable rainbow even when it happens to match
+     * the hue currently being displayed. */
+    if (!rainbow_mode && accent_rgb == rgb) return;
+    accent_set(rgb);
+    accent_visual_refresh(a);
 }
 
 /* Follow /etc/jt/accent.conf even when JTLab did not broadcast to us. The
@@ -7168,6 +7270,10 @@ static void accent_conf_poll(App *a)
     if (stat(ACCENT_CONF_PATH, &st) != 0) return;
     if (accent_conf_mtime != 0 && st.st_mtime == accent_conf_mtime) return;
     accent_conf_mtime = st.st_mtime;
+
+    /* Rainbow owns the accent. Consume the mtime change without adopting the
+     * new colour, so "rainbow off" still restores the original base. */
+    if (rainbow_mode) return;
 
     FILE *f = fopen(ACCENT_CONF_PATH, "r");
     if (!f) return;
@@ -10416,6 +10522,23 @@ static void ctl_handle_line(App *a, char *line)
                  line[n - 1] == '\r' || line[n - 1] == '\n')) line[--n] = '\0';
     if (!strcmp(line, "quit")) { a->quit = 1; return; }
     if (!strcmp(line, "reload")) { appearance_config_load(a); return; }
+    if (!strncmp(line, "rainbow", 7) &&
+        (line[7] == '\0' || line[7] == ' ' || line[7] == '\t')) {
+        const char *arg = line + 7;
+        while (*arg == ' ' || *arg == '\t') arg++;
+        int on;
+        if (!*arg || !strcmp(arg, "toggle"))
+            on = !rainbow_mode;
+        else if (!strcmp(arg, "on"))
+            on = 1;
+        else if (!strcmp(arg, "off"))
+            on = 0;
+        else
+            return;
+        rainbow_set(on, mono_sec());
+        accent_visual_refresh(a);
+        return;
+    }
     if (!strncmp(line, "accent", 6) && (line[6] == ' ' || line[6] == '\t')) {
         const char *arg = line + 6;
         while (*arg == ' ' || *arg == '\t') arg++;
@@ -10976,12 +11099,14 @@ static void on_signal(int sig)
 static void print_usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s [PATH] [--select FILE] [--accent #RRGGBB] [COLOR]\n"
+            "Usage: %s [PATH] [--select FILE] [--accent #RRGGBB] [rainbow] [COLOR]\n"
             "\n"
             "Wayland file manager with native icons and drive mount/unmount.\n"
             "Right-click for the Windows 10 style context menu.\n"
             "  --select FILE  open FILE's folder and highlight FILE\n"
             "                 (a FILE given as PATH is selected too)\n"
+            "  rainbow        cycle the accent through the colour wheel\n"
+            "                 (or --rainbow; an explicit colour turns it off)\n"
             "Use jtfilesctl to change the accent while it is running.\n",
             prog);
 }
@@ -11122,8 +11247,11 @@ int main(int argc, char **argv)
         int timeout_ms = 100;
         if (animating || lap_active) timeout_ms = SEL_LAP_TICK_MS;
         else if (app.search_pending) timeout_ms = SEARCH_SPIN_TICK_MS;
+        if (rainbow_mode && timeout_ms > 100) timeout_ms = 100;
         if (pump_events(&app, timeout_ms) < 0) break;
 
+        if (accent_tick(mono_sec()))
+            accent_visual_refresh(&app);
         keyboard_repeat_tick(&app);
         search_caret_tick(&app);
         if (app.search_pending) app.dirty = 1;   /* advance the spinner */

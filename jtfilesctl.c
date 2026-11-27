@@ -3,6 +3,7 @@
  * Usage:
  *   jtfilesctl accent '#RRGGBB'   change the accent live
  *   jtfilesctl '#RRGGBB'          shorthand for the same
+ *   jtfilesctl rainbow [on|off|toggle]   cycle accent colours
  *   jtfilesctl quit               exit the window
  */
 #include <errno.h>
@@ -60,9 +61,10 @@ static void
 usage(const char *prog)
 {
     fprintf(stderr,
-            "usage: %s accent '#RRGGBB'|quit\n"
+            "usage: %s accent '#RRGGBB'|rainbow [on|off|toggle]|quit\n"
             "       %s '#RRGGBB'\n"
             "  accent COLOR   change the window accent while it is running\n"
+            "  rainbow        cycle accent colours (toggle; on|off to be explicit)\n"
             "  quit           exit the window\n",
             prog, prog);
 }
@@ -89,6 +91,17 @@ main(int argc, char *argv[])
         snprintf(msg, sizeof(msg), "accent #%06X\n", rgb);
     } else if (argc == 2 && parse_color(argv[1], &rgb)) {
         snprintf(msg, sizeof(msg), "accent #%06X\n", rgb);
+    } else if (!strcmp(argv[1], "rainbow")) {
+        if (argc == 2) {
+            snprintf(msg, sizeof(msg), "rainbow\n");
+        } else if (argc == 3 && (!strcmp(argv[2], "on") ||
+                                 !strcmp(argv[2], "off") ||
+                                 !strcmp(argv[2], "toggle"))) {
+            snprintf(msg, sizeof(msg), "rainbow %s\n", argv[2]);
+        } else {
+            usage(argv[0]);
+            return 1;
+        }
     } else if (!strcmp(argv[1], "quit")) {
         if (argc != 2) {
             usage(argv[0]);
