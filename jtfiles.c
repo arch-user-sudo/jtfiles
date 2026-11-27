@@ -1469,6 +1469,7 @@ typedef struct {
     size_t size;
     int width, height;
     int busy, retired;
+    void *owner;                /* owning Menu for buffers that outlive it */
 } ShmBuf;
 
 static void shm_buffer_destroy(ShmBuf *b);
@@ -1481,6 +1482,9 @@ struct Menu {
     struct xdg_popup *popup;
     struct wl_callback *frame_cb;
     ShmBuf bufs[2];
+    /* A retired menu stays alive until every busy wl_buffer has released. */
+    Menu *retired_next;
+    int pending_bufs;
     int configured, dirty, done;
     int w, h;               /* w/h are the visible popup size */
     int content_h;          /* full height of all menu rows */
@@ -1791,6 +1795,7 @@ struct App {
     char last_cut[PATH_MAX];
 
     Menu *menu;
+    Menu *retired_menus;        /* freed menus with buffers still owned by compositor */
     int ctx_kind, ctx_index;
     Dialog dialog;
 
@@ -3634,10 +3639,11 @@ static void drive_refresh(App *a)
                 strcmp(d->dev, a->pending_mount_dev)) continue;
             char path[PATH_MAX];
             snprintf(path, sizeof path, "%s", d->mount);
-            a->pending_mount_dev[0] = '\0';
             struct stat st;
-            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode))
+            if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+                a->pending_mount_dev[0] = '\0';
                 navigate(a, path, 1);
+            }
             break;
         }
     }
@@ -3690,7 +3696,8 @@ static void drive_op_done(GObject *source, GAsyncResult *result, gpointer data)
         snprintf(j->result, sizeof j->result, "%s", err->message);
         g_error_free(err);
     }
-    j->active = 0;
+    /* Keep active set until job_release() so the slot stays reserved and
+     * jobs_dispatch() can finish and release it on the Wayland tick. */
     j->done = 1;
     if (j->app) {
         j->app->drives_dirty = 1;
@@ -5122,25 +5129,66 @@ static Menu *menu_create(App *a, Menu *parent, uint32_t serial,
     return m;
 }
 
+static void menu_retired_drop(Menu *m)
+{
+    if (!m) return;
+    App *a = m->app;
+    Menu **link = a ? &a->retired_menus : NULL;
+    if (link) {
+        while (*link && *link != m) link = &(*link)->retired_next;
+        if (*link == m) *link = m->retired_next;
+    }
+    m->retired_next = NULL;
+    free(m);
+}
+
+static void menu_retired_cleanup(App *a)
+{
+    Menu *m = a->retired_menus;
+    a->retired_menus = NULL;
+    while (m) {
+        Menu *next = m->retired_next;
+        for (int i = 0; i < 2; i++) shm_buffer_destroy(&m->bufs[i]);
+        m->retired_next = NULL;
+        free(m);
+        m = next;
+    }
+}
+
 static void menu_close(Menu *m)
 {
     if (!m) return;
     App *a = m->app;
-    if (m == a->menu) a->menu = NULL;
-    if (a->pointer_menu == m) a->pointer_menu = NULL;
+    if (a) {
+        if (a->menu == m) a->menu = NULL;
+        if (a->pointer_menu == m) a->pointer_menu = NULL;
+    }
 
     if (m->frame_cb) { wl_callback_destroy(m->frame_cb); m->frame_cb = NULL; }
     if (m->popup) { xdg_popup_destroy(m->popup); m->popup = NULL; }
     if (m->xdg_surface) { xdg_surface_destroy(m->xdg_surface); m->xdg_surface = NULL; }
-    if (m->surface) {
-        wl_surface_destroy(m->surface);
-        m->surface = NULL;
-        for (int i = 0; i < 2; i++) {
-            ShmBuf *b = &m->bufs[i];
-            if (!b->buffer) continue;
-            if (b->busy) b->retired = 1;
-            else shm_buffer_destroy(b);
-        }
+    if (m->surface) { wl_surface_destroy(m->surface); m->surface = NULL; }
+
+    int pending = 0;
+    for (int i = 0; i < 2; i++) {
+        ShmBuf *b = &m->bufs[i];
+        if (!b->buffer) continue;
+        b->owner = m;
+        if (b->busy) { b->retired = 1; pending++; }
+        else shm_buffer_destroy(b);
+    }
+    if (pending && !a) {
+        for (int i = 0; i < 2; i++)
+            if (m->bufs[i].retired) shm_buffer_destroy(&m->bufs[i]);
+        pending = 0;
+    }
+    /* The compositor still has wl_buffer proxies whose release events carry
+     * &m->bufs[i] as listener data. Keep the Menu alive until they fire. */
+    if (pending && a) {
+        m->pending_bufs = pending;
+        m->retired_next = a->retired_menus;
+        a->retired_menus = m;
+        return;
     }
     free(m);
 }
@@ -7438,14 +7486,20 @@ static void shm_buffer_destroy(ShmBuf *b)
     b->size = 0;
     b->width = b->height = 0;
     b->busy = b->retired = 0;
+    b->owner = NULL;
 }
 
 static void buffer_release(void *data, struct wl_buffer *buffer)
 {
     (void)buffer;
     ShmBuf *b = data;
+    int retired = b->retired;
+    Menu *owner = retired ? b->owner : NULL;
     b->busy = 0;
-    if (b->retired) shm_buffer_destroy(b);
+    if (!retired) return;
+    shm_buffer_destroy(b);
+    if (owner && owner->pending_bufs > 0 && --owner->pending_bufs == 0)
+        menu_retired_drop(owner);
 }
 
 static const struct wl_buffer_listener buffer_listener = {
@@ -7607,6 +7661,7 @@ static int menu_draw(App *a, Menu *m)
     if (w <= 0 || h <= 0) return 0;
     ShmBuf *b = next_buffer(a, m->bufs, 2, w, h);
     if (!b) return 0;
+    b->owner = m;
     menu_paint(a, m, b);
     if (wl_surface_get_version(m->surface) >= 3)
         wl_surface_set_buffer_scale(m->surface, a->scale);
@@ -8335,17 +8390,20 @@ static void menu_key(App *a, xkb_keysym_t sym)
 {
     if (!a->menu) return;
     Menu *m = a->menu;
+    Menu *parent = NULL;
     /* descend into the open submenu when arrow keys are used there */
     for (int depth = 0; depth < 4; depth++) {
         Menu *child = NULL;
         for (int i = 0; i < m->n; i++) if (m->items[i].sub) child = m->items[i].sub;
         if (!child) break;
+        parent = m;
         m = child;
     }
     if (sym == XKB_KEY_Escape) { menu_close_tree(a); return; }
-    if (sym == XKB_KEY_Left && m != a->menu) {
-        menu_close_rec(m);
-        for (int i = 0; i < a->menu->n; i++) a->menu->items[i].sub = NULL;
+    if (sym == XKB_KEY_Left && parent) {
+        /* Close the submenu through its parent so every dangling sub pointer
+         * is cleared, including when several nested levels are open. */
+        menu_clear_children(parent);
         return;
     }
     if (sym == XKB_KEY_Down || sym == XKB_KEY_Up) {
@@ -11220,22 +11278,20 @@ static void state_save(App *a)
     fclose(f);
 }
 
+/* Check the whole tree before closing it. Closing from inside the recursion
+ * would free the Menu whose item array the caller is still walking. */
+static int menu_tree_done(const Menu *m)
+{
+    if (!m) return 0;
+    if (m->done) return 1;
+    for (int i = 0; i < m->n; i++)
+        if (menu_tree_done(m->items[i].sub)) return 1;
+    return 0;
+}
+
 static void menu_handle_done(App *a, Menu *m)
 {
-    if (!m) return;
-    if (m->done) {
-        menu_close_tree(a);
-        return;
-    }
-    for (int i = 0; i < m->n; i++) {
-        Menu *sub = m->items[i].sub;
-        if (!sub) continue;
-        if (sub->done) {
-            menu_close_tree(a);
-            return;
-        }
-        menu_handle_done(a, sub);
-    }
+    if (menu_tree_done(m)) menu_close_tree(a);
 }
 
 static int pump_events(App *a, int timeout_ms)
@@ -11442,6 +11498,7 @@ static void app_cleanup(App *a)
 {
     g_app_signal = NULL;
     menu_close_tree(a);
+    menu_retired_cleanup(a);
     ctl_cleanup(a);
 
     if (a->ino_fd >= 0) { close(a->ino_fd); a->ino_fd = -1; }
@@ -11465,7 +11522,7 @@ static void app_cleanup(App *a)
         for (int spin = 0; spin < 100; spin++) {
             int active = 0;
             for (unsigned i = 0; i < sizeof a->jobs / sizeof a->jobs[0]; i++)
-                active += a->jobs[i].active != 0;
+                active += a->jobs[i].active && !a->jobs[i].done;
             if (!active) break;
             g_main_context_iteration(a->dbus_ctx, FALSE);
         }
