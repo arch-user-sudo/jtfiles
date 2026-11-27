@@ -1349,7 +1349,8 @@ enum {
     A_SORT_ASC, A_SORT_DESC,
     A_GROUP_NONE, A_GROUP_TYPE, A_GROUP_DATE,
     A_NEW_FOLDER, A_NEW_TEXT, A_NEW_SHORTCUT, A_NEW_ZIP,
-    A_REFRESH, A_PASTE, A_UNDO, A_SELECT_ALL, A_HIDDEN, A_SMOOTH_SCROLL,
+    A_REFRESH, A_PASTE, A_PASTE_INTO, A_UNDO, A_SELECT_ALL, A_HIDDEN,
+    A_SMOOTH_SCROLL,
     A_GO_BACK, A_GO_FORWARD, A_GO_UP, A_GO_HOME, A_MENU,
     A_DRIVE_OPEN, A_DRIVE_MOUNT, A_DRIVE_UNMOUNT, A_DRIVE_EJECT,
     A_QUIT
@@ -1364,6 +1365,10 @@ typedef struct {
     mode_t mode;
     off_t size;
     time_t mtime;
+    /* mtime used for date sorting.  A folder that receives a drop keeps its
+     * pre-drop value here so it does not jump to the top when its real mtime
+     * changes. */
+    time_t sort_mtime;
     char icon[64];
     char type[48];
     /* Folder item counts are computed on demand, not during dir_load().
@@ -1571,6 +1576,10 @@ typedef struct {
     int overflow;
     int attempt;
     double deadline;
+    /* Folder this paste should land in, captured when the menu item fires
+     * and kept until the async offer read completes. */
+    char dest[PATH_MAX];
+    int has_dest;
     /* 64 paths at PATH_MAX plus the gnome verb and separators. */
     char buf[64 * PATH_MAX + 4096];
 } ClipRead;
@@ -1582,6 +1591,9 @@ typedef struct ClipWrite {
     char *buf;
     size_t len, off;
 } ClipWrite;
+
+/* What is under an active drop point. */
+enum { DND_DROP_NONE, DND_DROP_FILE, DND_DROP_DIR, DND_DROP_NOOP };
 
 struct App {
     struct wl_display *display;
@@ -1621,8 +1633,12 @@ struct App {
     uint32_t dnd_action;                /* negotiated drag action (source side) */
     uint32_t dnd_offer_action;          /* action reported by wl_data_offer.action */
     int dnd_have_gnome;                 /* incoming drag offers cut/copy verb */
+    int dnd_actions_set;                /* source actions advertised once per drag */
+    int dnd_ctrl, dnd_shift;            /* live Windows-style drag modifiers */
     struct wl_surface *dnd_target_surface; /* surface the drag entered */
     double dnd_drop_x, dnd_drop_y;      /* last enter/motion coordinates */
+    int dnd_drop_kind;                  /* current drop target, see DND_DROP_* */
+    char dnd_drop_dir[PATH_MAX];        /* directory the drop would land in */
     char dnd_paths[64][PATH_MAX];       /* snapshot of our outgoing drag payload */
     int n_dnd_paths;
 
@@ -1671,6 +1687,11 @@ struct App {
     char post_dir[PATH_MAX];
     char post_names[64][NAME_MAX + 1];
     int n_post_names, post_armed;
+    /* A folder that just received a drop keeps its old date-sort key, so the
+     * directory mtime bump cannot move it to the top of the current view. */
+    char sort_fix_path[PATH_MAX];
+    time_t sort_fix_mtime;
+    int sort_fix_valid;
     /* Shared appearance.conf toggle for all accent-border laps. */
     int border_anim_enabled;
     /* >0: lap running; -1: lap already played for this batch. */
@@ -1815,11 +1836,18 @@ static void apply_post_xfer_selection(App *a);
 static void apply_pending_select(App *a);
 static void clipboard_publish(App *a);
 static void clipboard_publish_text(App *a, const char *text);
-static int  clipboard_fetch(App *a, int *cut);
+static int  clipboard_fetch(App *a, int *cut, const char *dest_dir);
 static int  clipboard_has(App *a);
 static void clip_read_cancel(App *a);
 static void clip_write_cancel_all(App *a);
 static void clip_write_poll(App *a, int fd);
+static uint32_t dnd_decide_action(App *a, const char *src, const char *dst);
+static void dnd_modifiers_snapshot(App *a);
+static void dnd_source_update_actions(App *a);
+static void dnd_offer_update_actions(App *a);
+static int  dnd_drop_target(App *a, double x, double y, char dir[PATH_MAX]);
+static void dnd_target_refresh(App *a);
+static void sort_freeze_dir(App *a, const char *dir);
 
 /* ---- sidebar hover easing (driven by wl_surface.frame / vsync) ------- */
 
@@ -1948,6 +1976,105 @@ static const char *base_name(const char *p)
 {
     const char *s = strrchr(p, '/');
     return s ? s + 1 : p;
+}
+
+/* Windows Explorer rules: Ctrl copies, Shift moves, otherwise a drop moves
+ * within one filesystem and copies across filesystems.  With no source path
+ * (an offer from another client) the filesystem test is deferred until the
+ * URI list has been read, so the default here is the safe copy. */
+static uint32_t dnd_decide_action(App *a, const char *src, const char *dst)
+{
+    if (a->dnd_ctrl && !a->dnd_shift)
+        return WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+    if (a->dnd_shift && !a->dnd_ctrl)
+        return WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
+    if (src && *src && dst && *dst) {
+        struct stat ss, ds;
+        if (stat(src, &ss) == 0 && stat(dst, &ds) == 0)
+            return ss.st_dev == ds.st_dev
+                       ? WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE
+                       : WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+    }
+    return WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+}
+
+static void dnd_modifiers_snapshot(App *a)
+{
+    if (!a->xkb_state) {
+        a->dnd_ctrl = a->dnd_shift = 0;
+        return;
+    }
+    a->dnd_ctrl = xkb_state_mod_name_is_active(a->xkb_state, XKB_MOD_NAME_CTRL,
+                                               XKB_STATE_MODS_EFFECTIVE) > 0;
+    a->dnd_shift = xkb_state_mod_name_is_active(a->xkb_state, XKB_MOD_NAME_SHIFT,
+                                                XKB_STATE_MODS_EFFECTIVE) > 0;
+}
+
+/* wlroots rejects a second set_actions, and rejects changes after start_drag.
+ * Advertise both supported actions once; the target chooses from live state. */
+static void dnd_source_update_actions(App *a)
+{
+    if (a->dnd_actions_set || !a->dnd_source ||
+        wl_data_source_get_version(a->dnd_source) <
+            WL_DATA_SOURCE_SET_ACTIONS_SINCE_VERSION)
+        return;
+    wl_data_source_set_actions(a->dnd_source,
+        WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+        WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
+    a->dnd_actions_set = 1;
+}
+
+static void dnd_offer_update_actions(App *a)
+{
+    if (!a->dnd_offer || !a->dnd_accepted ||
+        wl_data_offer_get_version(a->dnd_offer) <
+            WL_DATA_OFFER_SET_ACTIONS_SINCE_VERSION)
+        return;
+    uint32_t supported = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
+                         WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
+    uint32_t preferred;
+    if (a->dnd_drop_kind == DND_DROP_FILE || a->dnd_drop_kind == DND_DROP_NOOP) {
+        supported = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+        preferred = WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY;
+    } else {
+        preferred = dnd_decide_action(a,
+                    a->n_dnd_paths ? a->dnd_paths[0] : NULL,
+                    a->dnd_drop_dir[0] ? a->dnd_drop_dir : a->cwd);
+    }
+    wl_data_offer_set_actions(a->dnd_offer, supported, preferred);
+}
+
+static void dnd_target_refresh(App *a)
+{
+    char dir[PATH_MAX] = { 0 };
+    int kind = DND_DROP_NONE;
+    if (a->dnd_target_surface == a->surface)
+        kind = dnd_drop_target(a, a->dnd_drop_x, a->dnd_drop_y, dir);
+    if (!dir[0]) snprintf(dir, sizeof dir, "%s", a->cwd);
+    a->dnd_drop_kind = kind;
+    snprintf(a->dnd_drop_dir, sizeof a->dnd_drop_dir, "%s", dir);
+    dnd_offer_update_actions(a);
+    dnd_source_update_actions(a);
+}
+
+/* Hold a folder's old date-sort key through the reloads caused by a drop. */
+static void sort_freeze_dir(App *a, const char *dir)
+{
+    if (!dir || !*dir) return;
+    for (int i = 0; i < a->n_ents; i++) {
+        if (strcmp(a->ents[i].path, dir)) continue;
+        snprintf(a->sort_fix_path, sizeof a->sort_fix_path, "%s", dir);
+        a->sort_fix_mtime = a->ents[i].mtime;
+        a->sort_fix_valid = 1;
+        return;
+    }
+}
+
+static void sort_stable_apply(App *a, Entry *e)
+{
+    if (!a->sort_fix_valid || !e) return;
+    if (!strcmp(e->path, a->sort_fix_path))
+        e->sort_mtime = a->sort_fix_mtime;
 }
 
 /* Track the exact destination names chosen for a paste/drop.  do_paste() is
@@ -2268,11 +2395,13 @@ static int entry_cmp_fields(const void *va, const void *vb, const SortCtx *c)
         if (g) return g;
     }
     if (c->group_by == GROUP_DATE) {
-        int da = (int)(a->mtime / 86400), db = (int)(b->mtime / 86400);
+        int da = (int)(a->sort_mtime / 86400), db = (int)(b->sort_mtime / 86400);
         if (da != db) return desc ? db - da : da - db;
     }
     switch (c->sort_by) {
-    case SORT_DATE: r = (a->mtime > b->mtime) - (a->mtime < b->mtime); break;
+    case SORT_DATE:
+        r = (a->sort_mtime > b->sort_mtime) - (a->sort_mtime < b->sort_mtime);
+        break;
     case SORT_TYPE:
         r = strcmp(a->type, b->type);
         if (!r) r = strcasecmp(a->name, b->name);
@@ -2425,6 +2554,10 @@ static void dir_load(App *a, const char *path)
         status_set(a, "Cannot open %s: %s", real, strerror(errno));
         return;
     }
+    /* Reloads of the folder we are viewing (including the rescan after a
+     * drop) keep the frozen sort key.  Navigating elsewhere drops it, so a
+     * later visit sorts by the folder's current mtime. */
+    if (strcmp(a->cwd, real)) a->sort_fix_valid = 0;
     snprintf(a->cwd, sizeof a->cwd, "%s", real);
     watch_update(a, real);
     /* Any thumbnail rendering still in flight belongs to the old folder. */
@@ -2454,6 +2587,7 @@ static void dir_load(App *a, const char *path)
             e->mode = st.st_mode;
             e->size = st.st_size;
             e->mtime = st.st_mtime;
+            e->sort_mtime = st.st_mtime;
             e->is_link = S_ISLNK(st.st_mode);
             e->is_dir = S_ISDIR(st.st_mode);
             if (e->is_link) {
@@ -2463,6 +2597,7 @@ static void dir_load(App *a, const char *path)
             }
             if (e->is_dir) count_cache_lookup(a, e);
         }
+        sort_stable_apply(a, e);
         entry_icon(e);
         entry_type(e);
         a->n_ents++;
@@ -2722,6 +2857,7 @@ static void sr_walk(SearchScan *s, const char *dir, int depth, int *visited)
         e->mode = st.st_mode;
         e->size = st.st_size;
         e->mtime = st.st_mtime;
+        e->sort_mtime = st.st_mtime;
         e->is_dir = is_dir;
         e->is_link = is_link;
         entry_icon(e);
@@ -3057,7 +3193,9 @@ static void search_rebuild(App *a, int reset)
     for (int i = 0; i < nsrc; i++) {
         Entry *s = &src[i];
         if (!search_match(s, a->search)) continue;
-        a->ents[a->n_ents++] = *s;
+        Entry *d = &a->ents[a->n_ents++];
+        *d = *s;
+        sort_stable_apply(a, d);
     }
 
     free(a->selected);
@@ -5082,15 +5220,15 @@ static void action_activate(App *a, int id)
     case A_VIEW_TILES:
         if (a->search_active) { a->saved_view = VIEW_TILES; break; }
         a->view = VIEW_TILES; scroll_snap(a); a->dirty = 1; break;
-    case A_SORT_NAME: a->sort_by = SORT_NAME; search_sort(a); break;
-    case A_SORT_DATE: a->sort_by = SORT_DATE; search_sort(a); break;
-    case A_SORT_TYPE: a->sort_by = SORT_TYPE; search_sort(a); break;
-    case A_SORT_SIZE: a->sort_by = SORT_SIZE; search_sort(a); break;
-    case A_SORT_ASC: a->sort_desc = 0; search_sort(a); break;
-    case A_SORT_DESC: a->sort_desc = 1; search_sort(a); break;
-    case A_GROUP_NONE: a->group_by = GROUP_NONE; search_sort(a); break;
-    case A_GROUP_TYPE: a->group_by = GROUP_TYPE; search_sort(a); break;
-    case A_GROUP_DATE: a->group_by = GROUP_DATE; search_sort(a); break;
+    case A_SORT_NAME: a->sort_by = SORT_NAME; a->sort_fix_valid = 0; search_sort(a); break;
+    case A_SORT_DATE: a->sort_by = SORT_DATE; a->sort_fix_valid = 0; search_sort(a); break;
+    case A_SORT_TYPE: a->sort_by = SORT_TYPE; a->sort_fix_valid = 0; search_sort(a); break;
+    case A_SORT_SIZE: a->sort_by = SORT_SIZE; a->sort_fix_valid = 0; search_sort(a); break;
+    case A_SORT_ASC: a->sort_desc = 0; a->sort_fix_valid = 0; search_sort(a); break;
+    case A_SORT_DESC: a->sort_desc = 1; a->sort_fix_valid = 0; search_sort(a); break;
+    case A_GROUP_NONE: a->group_by = GROUP_NONE; a->sort_fix_valid = 0; search_sort(a); break;
+    case A_GROUP_TYPE: a->group_by = GROUP_TYPE; a->sort_fix_valid = 0; search_sort(a); break;
+    case A_GROUP_DATE: a->group_by = GROUP_DATE; a->sort_fix_valid = 0; search_sort(a); break;
     case A_NEW_FOLDER: case A_NEW_TEXT: case A_NEW_ZIP: do_new_item(a, id); break;
     case A_NEW_SHORTCUT: {
         char p[PATH_MAX];
@@ -5105,10 +5243,19 @@ static void action_activate(App *a, int id)
         do_rename(a, p);
         break;
     }
-    case A_REFRESH: drive_refresh(a); dir_load(a, a->cwd); break;
-    case A_PASTE: {
+    case A_REFRESH: drive_refresh(a); a->sort_fix_valid = 0; dir_load(a, a->cwd); break;
+    case A_PASTE:
+    case A_PASTE_INTO: {
         int cut = 0;
-        if (clipboard_fetch(a, &cut)) do_paste(a, NULL);
+        char dest[PATH_MAX] = { 0 };
+        /* A folder's context-menu Paste targets that folder; the background
+         * menu and Ctrl+V keep targeting the directory we are viewing. */
+        if (id == A_PASTE_INTO && e && e->is_dir) {
+            snprintf(dest, sizeof dest, "%s", e->path);
+            sort_freeze_dir(a, dest);
+        }
+        if (clipboard_fetch(a, &cut, dest))
+            do_paste(a, dest[0] ? dest : NULL);
         break;
     }
     case A_UNDO:
@@ -5192,6 +5339,8 @@ static void menu_open_root(App *a, uint32_t serial, int x, int y)
         msep(m);
         mitem(m, 0, A_CUT, "Cut", "Ctrl+X", 1);
         mitem(m, 0, A_COPY, "Copy", "Ctrl+C", 1);
+        if (e->is_dir)
+            mitem(m, 0, A_PASTE_INTO, "Paste", "", clipboard_has(a));
         mitem(m, 0, A_COPY_PATH, "Copy as path", "", 1);
         mitem(m, 0, A_SHORTCUT, "Create shortcut", "", 1);
         msep(m);
@@ -7655,9 +7804,13 @@ static void main_click(App *a, uint32_t serial, double x, double y, int button)
             int dbl = idx == a->last_click_row &&
                       now - a->last_click_t < 0.45 && !ctrl && !shift;
 
-            if (shift && a->anchor >= 0) select_range(a, idx);
+            /* Pressing an already-selected icon starts a drag of the whole
+             * selection; only double-click or a fresh click replaces it. */
+            if (dbl) select_one(a, idx);
+            else if (shift && a->anchor >= 0) select_range(a, idx);
             else if (ctrl) select_toggle(a, idx);
-            else select_one(a, idx);
+            else if (!a->selected[idx]) select_one(a, idx);
+            else { a->sel = idx; a->anchor = idx; }
 
             a->ctx_kind = CTX_FILE;
             a->ctx_index = idx;
@@ -8227,6 +8380,11 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard,
     (void)keyboard; (void)time;
     App *a = data;
     a->clip_serial = serial;
+    if (a->xkb_state) {
+        dnd_modifiers_snapshot(a);
+        dnd_source_update_actions(a);
+        dnd_offer_update_actions(a);
+    }
     if (state == WL_KEYBOARD_KEY_STATE_RELEASED) {
         if (a->repeat_active && a->repeat_key == key)
             keyboard_cancel_repeat(a);
@@ -9149,6 +9307,9 @@ static void keyboard_modifiers(void *data, struct wl_keyboard *kb,
     App *a = data;
     if (a->xkb_state)
         xkb_state_update_mask(a->xkb_state, dep, lat, lock, 0, 0, group);
+    dnd_modifiers_snapshot(a);
+    dnd_source_update_actions(a);
+    dnd_offer_update_actions(a);
 }
 
 /* jtlabwc sends repeat_info but leaves key event generation to clients. */
@@ -9630,12 +9791,12 @@ static void clip_read_drain(App *a)
     a->n_clip = count;
     a->clip_cut = cut;
     a->clip_cache_valid = 1;   /* GTK-style per-offer buffer cache */
-    do_paste(a, NULL);
+    do_paste(a, r->has_dest ? r->dest : NULL);
 }
 
 /* Pull a remote selection into a pending async read, or use local state.
  * A zero return with an active offer means paste will finish later. */
-static int clipboard_fetch(App *a, int *cut)
+static int clipboard_fetch(App *a, int *cut, const char *dest_dir)
 {
     *cut = 0;
     /* If we own the selection, our staged payload wins even before the
@@ -9660,7 +9821,15 @@ static int clipboard_fetch(App *a, int *cut)
     if (a->clip_ctx && (a->clip_ctx->uris || a->clip_ctx->gnome ||
                         a->clip_ctx->text)) {
         a->clip_read.attempt = 0;   /* new paste, not an empty-offer retry */
-        if (clipboard_start_async(a)) return 0;
+        if (clipboard_start_async(a)) {
+            ClipRead *r = &a->clip_read;
+            r->has_dest = dest_dir && *dest_dir;
+            if (r->has_dest)
+                snprintf(r->dest, sizeof r->dest, "%s", dest_dir);
+            else
+                r->dest[0] = '\0';
+            return 0;
+        }
     }
     if (a->n_clip > 0) {
         *cut = a->clip_cut;
@@ -9722,9 +9891,12 @@ static void dnd_source_cancelled(void *data, struct wl_data_source *source)
     if (a->dnd_source == source) {
         wl_data_source_destroy(source);
         a->dnd_source = NULL;
+        a->dnd_actions_set = 0;
     }
     dnd_icon_destroy(a);
     a->dnd_pending = 0;
+    /* Do not let a finished drag's payload influence a later external offer. */
+    a->n_dnd_paths = 0;
 }
 
 static void dnd_source_drop_performed(void *data, struct wl_data_source *source)
@@ -9736,9 +9908,11 @@ static void dnd_source_finished(void *data, struct wl_data_source *source)
     if (a->dnd_source == source) {
         wl_data_source_destroy(source);
         a->dnd_source = NULL;
+        a->dnd_actions_set = 0;
     }
     dnd_icon_destroy(a);
     a->dnd_pending = 0;
+    a->n_dnd_paths = 0;
 }
 
 static void dnd_source_action(void *data, struct wl_data_source *source,
@@ -9844,12 +10018,14 @@ static void dnd_begin(App *a)
     wl_data_source_offer(src, "text/uri-list");
     wl_data_source_offer(src, "x-special/gnome-copied-files");
     wl_data_source_offer(src, "text/plain;charset=utf-8");
-    if (wl_data_source_get_version(src) >= WL_DATA_SOURCE_SET_ACTIONS_SINCE_VERSION)
-        wl_data_source_set_actions(src, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
-                                        WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE);
     a->dnd_source = src;
+    a->dnd_actions_set = 0;
     a->dnd_pending = 0;
     a->dnd_action = 0;
+    a->dnd_drop_kind = DND_DROP_NONE;
+    a->dnd_drop_dir[0] = 0;
+    dnd_modifiers_snapshot(a);
+    dnd_source_update_actions(a);
     a->drag_select = 0;
     struct wl_surface *icon = dnd_icon_create(a);
     wl_data_device_start_drag(a->data_device, src, a->surface, icon,
@@ -9857,8 +10033,10 @@ static void dnd_begin(App *a)
     wl_display_flush(a->display);
 }
 
-static int dnd_receive_uris(App *a, struct wl_data_offer *offer)
+static int dnd_receive_uris(App *a, struct wl_data_offer *offer,
+                            const char *dest_dir, int *did_move)
 {
+    if (did_move) *did_move = 0;
     const char *mime = a->dnd_have_gnome ? "x-special/gnome-copied-files"
                                          : "text/uri-list";
     int p[2];
@@ -9879,21 +10057,17 @@ static int dnd_receive_uris(App *a, struct wl_data_offer *offer)
     close(p[0]);
     buf[len] = 0;
 
-    /* The gnome target starts with "cut" or "copy"; following lines are the
-     * same URIs text/uri-list would carry.  A cut is performed as a move by
-     * do_paste(), so the source app never has to delete anything itself. */
-    int cut = 0;
+    /* Skip the gnome cut/copy verb.  The action is chosen from the Windows
+     * rules and the paths we just received, not from the source's verb: it may
+     * be advertising the action its compositor negotiated rather than what
+     * Explorer would do for this destination. */
     char *lines = buf;
     if (a->dnd_have_gnome) {
         char *nl = strchr(buf, '\n');
-        if (nl) {
-            *nl = 0;
-            cut = !strcmp(buf, "cut") || !strncmp(buf, "cut\r", 4);
-            lines = nl + 1;
-        }
+        if (nl) lines = nl + 1;
     }
-    if (a->dnd_source) cut = 0;   /* our own drag: keep the old copy behavior */
 
+    char paths[64][PATH_MAX];
     int count = 0;
     char *save = NULL;
     for (char *line = strtok_r(lines, "\r\n", &save);
@@ -9902,16 +10076,22 @@ static int dnd_receive_uris(App *a, struct wl_data_offer *offer)
         char path[PATH_MAX];
         uri_to_path(line, path, sizeof path);
         if (!*path || access(path, F_OK) != 0) continue;
-        snprintf(a->clipboard[count], PATH_MAX, "%s", path);
-        count++;
+        snprintf(paths[count++], PATH_MAX, "%s", path);
     }
-    if (count) {
-        a->n_clip = count;
-        a->clip_cut = cut;
-        do_paste(a, NULL);
-        return 1;
-    }
-    return 0;
+    if (!count) return 0;
+
+    const char *dst = dest_dir && *dest_dir ? dest_dir : a->cwd;
+    int cut = dnd_decide_action(a, paths[0], dst) ==
+              WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
+    if (dest_dir && *dest_dir) sort_freeze_dir(a, dest_dir);
+
+    for (int i = 0; i < count; i++)
+        snprintf(a->clipboard[i], PATH_MAX, "%s", paths[i]);
+    a->n_clip = count;
+    a->clip_cut = cut;
+    do_paste(a, dest_dir);
+    if (did_move) *did_move = cut;
+    return 1;
 }
 
 /* MIME events arrive before enter()/selection(), so record them on the
@@ -10009,31 +10189,41 @@ static void data_offer_destroy_all(App *a)
     a->clip_offer = a->dnd_offer = NULL;
 }
 
-/* Folder entry under the drop point, ignoring one of the dragged items. */
-static Entry *dnd_drop_entry(App *a, double x, double y)
+/* What is under the drop point.  Background drops use the current folder,
+ * folder drops land in that folder, and file drops are ignored. */
+static int dnd_drop_target(App *a, double x, double y, char dir[PATH_MAX])
 {
     if (x < SIDEBAR_W || y < file_top_y(a) || y >= a->WIN_H - STATUS_H)
-        return NULL;
+        return DND_DROP_NONE;
     int idx = -1;
     if (a->view == VIEW_ICONS || a->view == VIEW_TILES) {
-        if (!icon_grid_hit(a, x, y, &idx)) return NULL;
+        if (!icon_grid_hit(a, x, y, &idx)) return DND_DROP_NONE;
     } else {
         idx = (int)((y - file_top_y(a)) / list_row_h(a)) + scroll_hit(a);
     }
-    if (idx < 0 || idx >= a->n_ents) return NULL;
+    if (idx < 0 || idx >= a->n_ents) return DND_DROP_NONE;
     Entry *e = &a->ents[idx];
-    if (!e->is_dir) return NULL;
-    for (int i = 0; i < a->n_dnd_paths; i++)
-        if (!strcmp(e->path, a->dnd_paths[i])) return NULL;
-    return e;
+    if (!e->is_dir) return DND_DROP_FILE;
+    /* Our own drag dropped on itself is a no-op, not a move into cwd. */
+    if (a->dnd_source) {
+        for (int i = 0; i < a->n_dnd_paths; i++)
+            if (!strcmp(e->path, a->dnd_paths[i])) return DND_DROP_NOOP;
+    }
+    if (dir) snprintf(dir, PATH_MAX, "%s", e->path);
+    return DND_DROP_DIR;
 }
 
-/* Our own drag coming back to us: move the snapshotted files without going
- * through wl_data_offer.receive().  A client cannot dispatch the compositor's
- * wl_data_source.send event while it is blocked reading the transfer pipe. */
-static void dnd_internal_drop(App *a)
+/* Our own drag coming back to us: copy/move the snapshotted files without
+ * going through wl_data_offer.receive().  A client cannot dispatch the
+ * compositor's wl_data_source.send event while blocked on the transfer pipe.
+ * Dropping onto a file or a dragged item itself does nothing. */
+static void dnd_internal_drop(App *a, int target, const char *dir)
 {
-    if (!a->dnd_source || !a->n_dnd_paths) return;
+    if (target == DND_DROP_FILE || target == DND_DROP_NOOP ||
+        !a->dnd_source || !a->n_dnd_paths) {
+        a->dnd_target_surface = NULL;
+        return;
+    }
 
     char saved_clip[64][PATH_MAX];
     int saved_n = a->n_clip, saved_cut = a->clip_cut;
@@ -10043,16 +10233,11 @@ static void dnd_internal_drop(App *a)
     for (int i = 0; i < a->n_dnd_paths; i++)
         snprintf(a->clipboard[i], PATH_MAX, "%s", a->dnd_paths[i]);
     a->n_clip = a->n_dnd_paths;
-    a->clip_cut = 1;              /* an internal drag is a move */
-
-    char folder[PATH_MAX];
-    const char *dir = NULL;
-    Entry *e = (a->dnd_target_surface == a->surface)
-                   ? dnd_drop_entry(a, a->dnd_drop_x, a->dnd_drop_y) : NULL;
-    if (e) {
-        snprintf(folder, sizeof folder, "%s", e->path);
-        dir = folder;
-    }
+    const char *dst = dir && *dir ? dir : a->cwd;
+    uint32_t action = dnd_decide_action(a, a->dnd_paths[0], dst);
+    a->dnd_action = action;
+    a->clip_cut = action == WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE;
+    if (dir && *dir) sort_freeze_dir(a, dir);
     do_paste(a, dir);
     /* The transfer is asynchronous; keep xfer_finish() from clearing the
      * clipboard we just restored for the user. */
@@ -10082,6 +10267,8 @@ static void dnd_offer_release(App *a, int success)
     a->dnd_accept = a->dnd_accepted = 0;
     a->dnd_offer_action = WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
     a->dnd_target_surface = NULL;
+    a->dnd_drop_kind = DND_DROP_NONE;
+    a->dnd_drop_dir[0] = 0;
     data_offer_prune(a, NULL);
 }
 
@@ -10111,12 +10298,8 @@ static void dnd_data_device_enter(void *data, struct wl_data_device *device,
         wl_data_offer_accept(offer, serial, a->dnd_have_gnome
                              ? "x-special/gnome-copied-files" : "text/uri-list");
         a->dnd_accepted = 1;
-        if (wl_data_offer_get_version(offer) >= WL_DATA_OFFER_SET_ACTIONS_SINCE_VERSION)
-            wl_data_offer_set_actions(offer,
-                WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY |
-                WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE,
-                WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
     }
+    dnd_target_refresh(a);
     data_offer_prune(a, ctx);
 }
 
@@ -10127,6 +10310,7 @@ static void dnd_data_device_motion(void *data, struct wl_data_device *device,
     App *a = data;
     a->dnd_drop_x = wl_fixed_to_double(x);
     a->dnd_drop_y = wl_fixed_to_double(y);
+    dnd_target_refresh(a);
 }
 
 static void dnd_data_device_leave(void *data, struct wl_data_device *device)
@@ -10137,6 +10321,8 @@ static void dnd_data_device_leave(void *data, struct wl_data_device *device)
     a->dnd_accept = a->dnd_accepted = 0;
     a->dnd_offer_action = WL_DATA_DEVICE_MANAGER_DND_ACTION_NONE;
     a->dnd_target_surface = NULL;
+    a->dnd_drop_kind = DND_DROP_NONE;
+    a->dnd_drop_dir[0] = 0;
     data_offer_prune(a, NULL);
 }
 
@@ -10144,13 +10330,32 @@ static void dnd_data_device_drop(void *data, struct wl_data_device *device)
 {
     (void)device;
     App *a = data;
-    int ok = 0;
+    char folder[PATH_MAX] = { 0 };
+    int target = (a->dnd_target_surface == a->surface)
+                     ? dnd_drop_target(a, a->dnd_drop_x, a->dnd_drop_y, folder)
+                     : DND_DROP_NONE;
+    /* Dropping on a file is deliberately inert.  Do not finish the offer: a
+     * source offering MOVE would otherwise delete its originals on finish. */
+    if (target == DND_DROP_FILE || target == DND_DROP_NOOP) {
+        a->dnd_target_surface = NULL;
+        dnd_offer_release(a, 0);
+        return;
+    }
+    const char *dir = target == DND_DROP_DIR ? folder : NULL;
+
+    int ok = 0, did_move = 0;
     if (a->dnd_source) {
-        dnd_internal_drop(a);
+        dnd_internal_drop(a, target, dir);
         ok = 1;                 /* no pipe transfer: no deadlock, no data lost */
     } else if (a->dnd_offer && a->dnd_accept) {
-        ok = dnd_receive_uris(a, a->dnd_offer);
+        ok = dnd_receive_uris(a, a->dnd_offer, dir, &did_move);
     }
+    /* We may have performed a copy while the compositor negotiated MOVE.
+     * Finishing then would make the source delete its originals too, so leave
+     * the offer unfinished and let the source treat it as cancelled. */
+    if (ok && !did_move &&
+        a->dnd_offer_action == WL_DATA_DEVICE_MANAGER_DND_ACTION_MOVE)
+        ok = 0;
     dnd_offer_release(a, ok);
 }
 
@@ -10224,6 +10429,7 @@ static void release_seat(App *a)
         wl_data_source_destroy(a->dnd_source);
         a->dnd_source = NULL;
     }
+    a->dnd_actions_set = 0;
     a->dnd_pending = 0;
     a->n_dnd_paths = 0;
     a->dnd_target_surface = NULL;
